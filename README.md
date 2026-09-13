@@ -11,7 +11,7 @@ cd team-wiki-setup
 WIKI_PUBLISH_TOKEN=<token> ./install.sh
 ```
 
-Get the token from the team password manager (ask David). Prerequisites:
+Get the token from the Slack message (ask David). Prerequisites:
 `node` and `jq` (`brew install jq`). Restart Claude Code afterward. Re-run any
 time to update — it's idempotent.
 
