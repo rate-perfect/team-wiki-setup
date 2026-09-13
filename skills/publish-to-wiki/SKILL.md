@@ -26,9 +26,10 @@ secrets, or anything the user marks private/local-only.
   complete `<!doctype html>` document (it renders as-is in a sandboxed frame).
 - **summary** — one line shown in the dashboard list.
 - **tags** — optional list.
-- **author** — who the page is from: the name (or email) of the person you're
-  doing this for, so the wiki shows and can filter by who created it. Use their
-  name if you know it, else their email.
+- **author** *(required)* — who the page is from: the name (or email) of the
+  person you're doing this for, so the wiki shows and can filter by who created
+  it. Use their name if you know it, else their email; if you truly can't tell,
+  ask them — don't publish without it. (The API rejects a publish with no author.)
 - **body** — the Markdown text, or the full HTML document.
 
 ## How to publish
