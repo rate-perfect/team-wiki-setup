@@ -26,6 +26,9 @@ secrets, or anything the user marks private/local-only.
   complete `<!doctype html>` document (it renders as-is in a sandboxed frame).
 - **summary** — one line shown in the dashboard list.
 - **tags** — optional list.
+- **author** — who the page is from: the name (or email) of the person you're
+  doing this for, so the wiki shows and can filter by who created it. Use their
+  name if you know it, else their email.
 - **body** — the Markdown text, or the full HTML document.
 
 ## How to publish
@@ -42,9 +45,10 @@ jq -n \
   --arg visibility "$VISIBILITY" \
   --arg format "$FORMAT" \
   --arg summary "$SUMMARY" \
+  --arg author "$AUTHOR" \
   --rawfile body "$BODY_FILE" \
   --argjson tags "$TAGS_JSON" \
-  '{title:$title, visibility:$visibility, format:$format, summary:$summary, tags:$tags, body:$body}' \
+  '{title:$title, visibility:$visibility, format:$format, summary:$summary, author:$author, tags:$tags, body:$body}' \
 | curl -sS -X POST "$WIKI_PUBLISH_URL/api/publish" \
     -H "Authorization: Bearer $WIKI_PUBLISH_TOKEN" \
     -H "Content-Type: application/json" \
