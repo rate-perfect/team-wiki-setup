@@ -56,6 +56,34 @@ fs.writeFileSync(p, JSON.stringify(s,null,2)+"\n");
 '
 echo "✓ set WIKI_PUBLISH_URL + WIKI_PUBLISH_TOKEN in ~/.claude/settings.json"
 
+# --- 4. install the "mirror to the wiki" reminder hook (idempotent) ---
+# A PostToolUse hook on the Artifact tool: after you publish an artifact it
+# injects a reminder to also mirror shareable output to the wiki. It's a
+# reminder only (never an auto-publish), so judgment on scratch/secret/public
+# stays in the loop — but the prompt can't be silently skipped, because the
+# harness runs hooks deterministically. Fires only on a publish; needs `jq`.
+mkdir -p "$CLAUDE_DIR/hooks"
+cp "$SCRIPT_DIR/hooks/remind-wiki-mirror.sh" "$CLAUDE_DIR/hooks/remind-wiki-mirror.sh"
+chmod +x "$CLAUDE_DIR/hooks/remind-wiki-mirror.sh"
+node -e '
+const fs=require("fs"),os=require("os"),path=require("path");
+const p=path.join(os.homedir(),".claude","settings.json");
+let s={}; try{ s=JSON.parse(fs.readFileSync(p,"utf8")); }catch(e){}
+s.hooks=s.hooks||{};
+s.hooks.PostToolUse=s.hooks.PostToolUse||[];
+const CMD="~/.claude/hooks/remind-wiki-mirror.sh";
+let grp=s.hooks.PostToolUse.find(g=>g&&g.matcher==="Artifact");
+if(!grp){ grp={matcher:"Artifact",hooks:[]}; s.hooks.PostToolUse.push(grp); }
+grp.hooks=grp.hooks||[];
+if(!grp.hooks.some(h=>h&&h.command===CMD)){
+  grp.hooks.push({type:"command",command:CMD,timeout:10,statusMessage:"wiki mirror reminder"});
+}
+fs.mkdirSync(path.dirname(p),{recursive:true});
+fs.writeFileSync(p, JSON.stringify(s,null,2)+"\n");
+'
+echo "✓ installed wiki-mirror reminder hook (PostToolUse · Artifact)"
+
 echo
-echo "Done. Restart any open Claude Code sessions to pick up the changes."
+echo "Done. Restart any open Claude Code sessions to pick up the changes"
+echo "(or run /hooks once to reload config in a running session)."
 echo "Test it: in a Claude Code session, ask \"publish a quick test note to the wiki\"."
