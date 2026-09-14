@@ -28,6 +28,25 @@ for matching **internal (team)** pages (all terms must match; omit `q` to list
 everything). If you find the page, give the user `https://wiki.perfecti.io` +
 its `url` instead of remaking it. (Private/owner-only pages never appear here.)
 
+## Read a page (get its content)
+To fetch one page's stored source, add `slug=` to the same endpoint:
+
+```bash
+curl -sS "$WIKI_PUBLISH_URL/api/pages?slug=THE-SLUG" \
+  -H "Authorization: Bearer $WIKI_PUBLISH_TOKEN"
+```
+
+Returns `{ ok:true, page:{slug,title,summary,tags,author,created,updated,url,
+format,body,visibility,owner?} }` — `body` is the raw stored source and
+`format` is `"markdown"` or `"html"`. A missing slug returns
+`{ ok:false, error:"not found" }` (HTTP 404). Use it to read back a page you
+found via search — e.g. to update or extend it, or to reuse its content.
+
+Only `internal` and `public` pages are readable this way. The token is a shared
+service token with no per-user identity, so it can never be a page's owner:
+`private` (owner-only) pages return 404 here, exactly as a non-owner sees on the
+site. (Read a private page's content by signing in as its owner on the site.)
+
 ## When to publish
 As the finishing step whenever you produce something meant to be read or shared
 (report, summary, write-up, spec, analysis, dashboard, runbook, HTML
