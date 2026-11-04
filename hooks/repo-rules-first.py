@@ -484,7 +484,7 @@ def main():
             continue
         missing = unread(files, data)
         denials = int(read_text(key + ".n") or "0")
-        if not missing and denials > 0:
+        if not missing:  # already read (before the first change, or after an earlier block)
             open(key + ".ok", "w").close()
             continue
         if denials >= MAX_DENIALS:
