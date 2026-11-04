@@ -66,10 +66,17 @@ secrets, or anything the user marks private/local-only.
     private**), so private-first is a safe default when unsure.
   - `public`: unlisted, link-only, for sharing *outside* the team. **Confirm
     with the user before publishing anything public.**
+- **share** *(optional, internal/private only)* — `true` also creates (or
+  refreshes) an unlisted `/p/<id>` link, returned as `sharedUrl`. Use it when the
+  user wants to share a **private** page with specific people without making it
+  visible to the team; the page itself stays private. The link always shows
+  the page's latest version, so later edits need no re-share. Confirm before
+  sharing, same as public. The owner can revoke it with the page's **Revoke**.
 - **owner** — the owner's email. **Required when `visibility` is `private`**
   (that person becomes the sole viewer). Omit otherwise.
 - **format** — `markdown` for written content, or `html` when the artifact is a
   complete `<!doctype html>` document (renders as-is in a sandboxed frame).
+- **Make it easy to consume.** Lead with the conclusion or plan, and put supporting detail below it. Markdown pages support tables and **collapsible sections** (`<details><summary>Title</summary>` … `</details>`, with a blank line after `</summary>` and before `</details>`), which suit long technical detail.
 - **summary** — one line shown in the dashboard list.
 - **tags** — optional list.
 - **author** *(required)* — who the page is from: the name (or email) of the
