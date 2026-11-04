@@ -34,9 +34,15 @@ Claude changes any git repo, it must first read that repo's own rules
 and files they import). This works even when the Claude session started in a
 different folder. If Claude hasn't read them, the hook pauses the change and
 shows the rules (or names the files to read). The hook holds no rules of its
-own, so each repo stays the source of truth. Read-only commands are never
-paused. It needs `python3`, lets everything through if it hits an error, and
-never pauses the same repo more than 4 times.
+own, so each repo stays the source of truth. Commands that only read (such
+as `git status`, `cat` or `grep`) are not paused; builds, tests and package
+commands (`npm run`, `pnpm`, `make`, `dotnet test`) count as changes. It needs
+`python3`, lets everything through if it hits an error, and never pauses the
+same repo more than 4 times per session.
+
+The installer keeps a copy of your previous `~/.claude/CLAUDE.md` and
+`~/.claude/settings.json` as `.bak` files next to them. It leaves
+`settings.json` untouched and stops if that file isn't valid JSON.
 
 Optional settings for the repo rules hook:
 

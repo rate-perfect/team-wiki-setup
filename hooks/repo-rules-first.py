@@ -216,6 +216,10 @@ def transcripts(data):
     return [p for p in paths if os.path.isfile(p)]
 
 
+READ_CONTENTS = re.compile(r"Contents of (/[^\s\"\\]+)")
+READ_FILE_PATH = re.compile(r'"file_path":\s*"((?:[^"\\]|\\.)*)"')
+
+
 def unread(files, data):
     """Rule files that do not yet appear in this session's (or subagent's) transcript."""
     texts = []
@@ -226,11 +230,27 @@ def unread(files, data):
         except OSError:
             pass
     blob = "\n".join(texts)
+    # The session may have used a symlinked path (/tmp vs /private/tmp, ~/projects/x -> /Volumes/...), while the
+    # rule files come from git's resolved toplevel. Compare resolved paths too.
+    seen = set()
+    for raw in set(READ_CONTENTS.findall(blob)):
+        seen.add(raw.rstrip(":"))
+    for raw in set(READ_FILE_PATH.findall(blob)):
+        try:
+            seen.add(json.loads(f'"{raw}"'))
+        except ValueError:
+            pass
+    seen_real = set()
+    for s in seen:
+        try:
+            seen_real.add(os.path.realpath(s))
+        except (OSError, ValueError):
+            pass
     missing = []
     for f in files:
         j = json.dumps(f)[1:-1]
         if (f"Contents of {f}" in blob or f"Contents of {j}" in blob or f'"file_path":"{j}"' in blob
-                or f'"file_path": "{j}"' in blob):
+                or f'"file_path": "{j}"' in blob or os.path.realpath(f) in seen_real):
             continue
         missing.append(f)
     return missing
@@ -267,8 +287,8 @@ def main_rule_text():
     if i < 0:
         return None
     rest = text[i + len(MAIN_RULE_HEADING):]
-    j = rest.find("\n# ")
-    return (MAIN_RULE_HEADING + (rest[:j] if j >= 0 else rest)).strip()
+    ends = [k for k in (rest.find("\n# "), rest.find("\n<!--")) if k >= 0]
+    return (MAIN_RULE_HEADING + (rest[:min(ends)] if ends else rest)).strip()
 
 
 def is_main_checkout(top):
@@ -452,6 +472,7 @@ def main():
         return
     mdir = os.path.join(STATE, session, re.sub(r"[^\w.-]", "_", data.get("agent_id") or "main"))
     os.makedirs(mdir, exist_ok=True)
+    os.utime(os.path.join(STATE, session))  # mark the session as active, so pruning leaves it alone
     for top in tops:
         key = os.path.join(mdir, hashlib.sha1(top.encode()).hexdigest())
         if os.path.exists(key + ".ok"):

@@ -37,72 +37,76 @@ for skill_dir in "$SCRIPT_DIR"/skills/*/; do
 done
 
 # --- 2. add the team instruction to user-global CLAUDE.md (idempotent) ---
+# The team block sits between BEGIN/END markers and is replaced on every run;
+# everything outside the markers is yours and is kept. A backup of the previous
+# file is kept at ~/.claude/CLAUDE.md.bak. Written through a symlink if
+# CLAUDE.md is one (e.g. kept in a dotfiles repo).
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
+BEGIN_MARK='<!-- BEGIN perfecti-team-wiki -->'
+END_MARK='<!-- END perfecti-team-wiki -->'
 touch "$CLAUDE_MD"
-if grep -q "BEGIN perfecti-team-wiki" "$CLAUDE_MD"; then
-  sed -i.bak '/<!-- BEGIN perfecti-team-wiki -->/,/<!-- END perfecti-team-wiki -->/d' "$CLAUDE_MD"
-  rm -f "$CLAUDE_MD.bak"
+HAS_BEGIN=0; HAS_END=0
+if grep -qF "$BEGIN_MARK" "$CLAUDE_MD"; then HAS_BEGIN=1; fi
+if grep -qF "$END_MARK" "$CLAUDE_MD"; then HAS_END=1; fi
+if [ "$HAS_BEGIN" != "$HAS_END" ]; then
+  echo "ERROR: ~/.claude/CLAUDE.md has only one of the $BEGIN_MARK / $END_MARK lines."
+  echo "       Put the missing line back (or delete the whole team block), then re-run."
+  exit 1
 fi
-# Trim trailing blank lines first so re-running doesn't add one each time.
-REST="$(cat "$CLAUDE_MD")"
-{ [ -n "$REST" ] && printf '%s\n\n' "$REST"; cat "$SCRIPT_DIR/claude-instructions.md"; } > "$CLAUDE_MD.tmp"
-mv "$CLAUDE_MD.tmp" "$CLAUDE_MD"
-echo "✓ updated instruction block in ~/.claude/CLAUDE.md"
+cp "$CLAUDE_MD" "$CLAUDE_MD.bak"
+TMP_MD="$(mktemp)"
+awk -v b="$BEGIN_MARK" -v e="$END_MARK" 'index($0,b){skip=1} !skip{print} index($0,e){skip=0}' "$CLAUDE_MD" > "$TMP_MD"
+REST="$(cat "$TMP_MD")"   # $(...) also drops trailing blank lines, so re-runs don't add one each time
+{
+  if [ -n "$REST" ]; then printf '%s\n\n' "$REST"; fi
+  cat "$SCRIPT_DIR/claude-instructions.md"
+} > "$TMP_MD"
+cat "$TMP_MD" > "$CLAUDE_MD"
+rm -f "$TMP_MD"
+echo "✓ updated instruction block in ~/.claude/CLAUDE.md (previous copy: ~/.claude/CLAUDE.md.bak)"
 
-# --- 3. set env vars in user-global settings.json (merge, don't clobber) ---
+# --- 3. copy the team hooks ---
+# remind-wiki-mirror.sh: a PostToolUse hook on the Artifact tool. After you
+# publish an artifact it reminds Claude to also mirror shareable output to the
+# wiki. A reminder only (never an auto-publish), so judgment on
+# scratch/secret/public stays in the loop. Fires only on a publish; needs jq.
+#
+# repo-rules-first.py: a PreToolUse hook on Edit|Write|NotebookEdit|Bash.
+# Before Claude changes a git checkout, it must have read that checkout's own
+# CLAUDE.md (and related rule files), even when the session started in another
+# folder. The hook holds no rules of its own; each repo stays the source of
+# truth. A SessionStart hook (on compact) makes it check again after the
+# conversation is compacted. It fails open and never blocks the same repo more
+# than 4 times. Needs python3.
+mkdir -p "$CLAUDE_DIR/hooks"
+for hook in remind-wiki-mirror.sh repo-rules-first.py; do
+  cp "$SCRIPT_DIR/hooks/$hook" "$CLAUDE_DIR/hooks/$hook"
+  chmod +x "$CLAUDE_DIR/hooks/$hook"
+done
+
+# --- 4. update user-global settings.json: env vars + hooks (merge, don't clobber) ---
+# Stops without writing if settings.json exists but isn't valid JSON, so your
+# other settings are never lost. A backup is kept at ~/.claude/settings.json.bak.
 WIKI_PUBLISH_URL="$WIKI_PUBLISH_URL" WIKI_PUBLISH_TOKEN="$WIKI_PUBLISH_TOKEN" node -e '
 const fs=require("fs"),os=require("os"),path=require("path");
 const p=path.join(os.homedir(),".claude","settings.json");
-let s={};
-try{ s=JSON.parse(fs.readFileSync(p,"utf8")); }catch(e){}
+let s={}, raw=null;
+try{ raw=fs.readFileSync(p,"utf8"); }catch(e){ if(e.code!=="ENOENT") throw e; }
+if(raw!==null && raw.trim()!==""){
+  try{ s=JSON.parse(raw); }catch(e){
+    console.error("ERROR: ~/.claude/settings.json is not valid JSON ("+e.message+").");
+    console.error("       settings.json was not changed. Fix it, then re-run.");
+    process.exit(1);
+  }
+  if(!s||typeof s!=="object"||Array.isArray(s)){
+    console.error("ERROR: ~/.claude/settings.json is not a JSON object. It was not changed. Fix it, then re-run.");
+    process.exit(1);
+  }
+  fs.writeFileSync(p+".bak", raw);
+}
 s.env=s.env||{};
 s.env.WIKI_PUBLISH_URL=process.env.WIKI_PUBLISH_URL;
 s.env.WIKI_PUBLISH_TOKEN=process.env.WIKI_PUBLISH_TOKEN;
-fs.mkdirSync(path.dirname(p),{recursive:true});
-fs.writeFileSync(p, JSON.stringify(s,null,2)+"\n");
-'
-echo "✓ set WIKI_PUBLISH_URL + WIKI_PUBLISH_TOKEN in ~/.claude/settings.json"
-
-# --- 4. install the "mirror to the wiki" reminder hook (idempotent) ---
-# A PostToolUse hook on the Artifact tool: after you publish an artifact it
-# injects a reminder to also mirror shareable output to the wiki. It's a
-# reminder only (never an auto-publish), so judgment on scratch/secret/public
-# stays in the loop — but the prompt can't be silently skipped, because the
-# harness runs hooks deterministically. Fires only on a publish; needs `jq`.
-mkdir -p "$CLAUDE_DIR/hooks"
-cp "$SCRIPT_DIR/hooks/remind-wiki-mirror.sh" "$CLAUDE_DIR/hooks/remind-wiki-mirror.sh"
-chmod +x "$CLAUDE_DIR/hooks/remind-wiki-mirror.sh"
-node -e '
-const fs=require("fs"),os=require("os"),path=require("path");
-const p=path.join(os.homedir(),".claude","settings.json");
-let s={}; try{ s=JSON.parse(fs.readFileSync(p,"utf8")); }catch(e){}
-s.hooks=s.hooks||{};
-s.hooks.PostToolUse=s.hooks.PostToolUse||[];
-const CMD="~/.claude/hooks/remind-wiki-mirror.sh";
-let grp=s.hooks.PostToolUse.find(g=>g&&g.matcher==="Artifact");
-if(!grp){ grp={matcher:"Artifact",hooks:[]}; s.hooks.PostToolUse.push(grp); }
-grp.hooks=grp.hooks||[];
-if(!grp.hooks.some(h=>h&&h.command===CMD)){
-  grp.hooks.push({type:"command",command:CMD,timeout:10,statusMessage:"wiki mirror reminder"});
-}
-fs.mkdirSync(path.dirname(p),{recursive:true});
-fs.writeFileSync(p, JSON.stringify(s,null,2)+"\n");
-'
-echo "✓ installed wiki-mirror reminder hook (PostToolUse · Artifact)"
-
-# --- 5. install the "repo rules first" hook (idempotent) ---
-# A PreToolUse hook on Edit|Write|NotebookEdit|Bash: before Claude changes a git
-# checkout, it must have read that checkout's own CLAUDE.md (and related rule
-# files), even when the session started in another folder. The hook holds no
-# rules of its own; each repo stays the source of truth. A SessionStart hook
-# (on compact) makes it check again after the conversation is compacted. It
-# fails open and never blocks the same repo more than 4 times. Needs python3.
-cp "$SCRIPT_DIR/hooks/repo-rules-first.py" "$CLAUDE_DIR/hooks/repo-rules-first.py"
-chmod +x "$CLAUDE_DIR/hooks/repo-rules-first.py"
-node -e '
-const fs=require("fs"),os=require("os"),path=require("path");
-const p=path.join(os.homedir(),".claude","settings.json");
-let s={}; try{ s=JSON.parse(fs.readFileSync(p,"utf8")); }catch(e){}
 s.hooks=s.hooks||{};
 function add(event, matcher, hook){
   s.hooks[event]=s.hooks[event]||[];
@@ -111,6 +115,8 @@ function add(event, matcher, hook){
   grp.hooks=grp.hooks||[];
   if(!grp.hooks.some(h=>h&&h.command===hook.command)) grp.hooks.push(hook);
 }
+add("PostToolUse","Artifact",
+    {type:"command",command:"~/.claude/hooks/remind-wiki-mirror.sh",timeout:10,statusMessage:"wiki mirror reminder"});
 add("PreToolUse","Edit|Write|NotebookEdit|Bash",
     {type:"command",command:"python3 ~/.claude/hooks/repo-rules-first.py",timeout:15,statusMessage:"repo rules check"});
 add("SessionStart","compact",
@@ -118,6 +124,8 @@ add("SessionStart","compact",
 fs.mkdirSync(path.dirname(p),{recursive:true});
 fs.writeFileSync(p, JSON.stringify(s,null,2)+"\n");
 '
+echo "✓ set WIKI_PUBLISH_URL + WIKI_PUBLISH_TOKEN in ~/.claude/settings.json (previous copy: ~/.claude/settings.json.bak)"
+echo "✓ installed wiki-mirror reminder hook (PostToolUse · Artifact)"
 echo "✓ installed repo-rules-first hook (PreToolUse · Edit|Write|NotebookEdit|Bash)"
 
 echo
