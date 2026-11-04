@@ -216,6 +216,7 @@ def transcripts(data):
     return [p for p in paths if os.path.isfile(p)]
 
 
+COMPACT_BOUNDARY = '"subtype":"compact_boundary"'
 READ_CONTENTS = re.compile(r"Contents of (/[^\s\"\\]+)")
 READ_FILE_PATH = re.compile(r'"file_path":\s*"((?:[^"\\]|\\.)*)"')
 
@@ -226,9 +227,13 @@ def unread(files, data):
     for p in transcripts(data)[:1] if data.get("agent_id") else transcripts(data):
         try:
             with open(p, encoding="utf-8", errors="replace") as fh:
-                texts.append(fh.read())
+                text = fh.read()
         except OSError:
-            pass
+            continue
+        # Compaction keeps writing to the same transcript, but drops earlier reads from Claude's context. Only reads
+        # after the last compaction count (Claude Code re-loads the start folder's CLAUDE.md after it).
+        b = text.rfind(COMPACT_BOUNDARY)
+        texts.append(text[text.rfind("\n", 0, b) + 1:] if b >= 0 else text)
     blob = "\n".join(texts)
     # The session may have used a symlinked path (/tmp vs /private/tmp, ~/projects/x -> /Volumes/...), while the
     # rule files come from git's resolved toplevel. Compare resolved paths too.
@@ -256,11 +261,11 @@ def unread(files, data):
     return missing
 
 
-def header(top):
+def header(top, reason="this session has not read that checkout's own rules yet"):
     branch = git(["rev-parse", "--abbrev-ref", "HEAD"], top) or "?"
     head = git(["rev-parse", "--short", "HEAD"], top) or "?"
     return (f"REPO RULES FIRST: you are about to change {top} (branch {branch}, {head}). The call was paused "
-            "because this session has not read that checkout's own rules yet. ")
+            f"because {reason}. ")
 
 
 TAIL = ("Follow them. Where they conflict with the user's instructions or memory, the user's instructions win; tell "
@@ -484,9 +489,21 @@ def main():
             continue
         missing = unread(files, data)
         denials = int(read_text(key + ".n") or "0")
-        if not missing and denials > 0:
+        if not missing:  # rule files already read (before the first change, or after an earlier block)
             open(key + ".ok", "w").close()
-            continue
+            if not rows or denials > 0:
+                continue
+            # Its rule files are read, but it also has commands, agents, rule docs or nested CLAUDE.md files that
+            # nothing has shown yet. Pause once to list them.
+            done = "Its rule files are already read." if files else "It has no CLAUDE.md of its own."
+            msg = (header(top, "this repo has more than its main rule files") + done
+                   + "\n\nAlso in this repo:\n" + "\n".join(rows) + "\n\n" + TAIL)
+            print(json.dumps({
+                "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": msg},
+                "systemMessage": f"Repo rules first: listed {os.path.basename(top)}'s commands and rule docs.",
+            }))
+            return
         if denials >= MAX_DENIALS:
             open(key + ".ok", "w").close()
             with open(os.path.join(STATE, "errors.log"), "a") as fh:
