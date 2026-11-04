@@ -17,7 +17,10 @@ time to update — it's idempotent.
 
 ## What it does
 
-It installs a `publish-to-wiki` skill, adds a strong-default instruction to your
+It installs the team skills in `skills/` into `~/.claude/skills` so they work
+in every repo: `publish-to-wiki`, and `verification` (run `/verification` to
+make Claude prove or disprove a claim, such as a suspected bug cause, instead of
+guessing). It also adds a strong-default instruction to your
 `~/.claude/CLAUDE.md`, sets the publish endpoint + token in your
 `~/.claude/settings.json`, and installs a small **reminder hook** (PostToolUse
 on the Artifact tool) that nudges Claude to mirror shareable output to the wiki

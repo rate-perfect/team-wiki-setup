@@ -6,7 +6,7 @@
 #
 # (or just ./install.sh and it will prompt for the token). Get the token from
 # David (posted in Slack). Re-run any time to update to the latest
-# instruction + skill (safe/idempotent).
+# instruction + skills (safe/idempotent).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,10 +26,14 @@ fi
 
 mkdir -p "$CLAUDE_DIR/skills"
 
-# --- 1. install the skill ---
-rm -rf "$CLAUDE_DIR/skills/publish-to-wiki"
-cp -R "$SCRIPT_DIR/skills/publish-to-wiki" "$CLAUDE_DIR/skills/publish-to-wiki"
-echo "✓ installed skill: ~/.claude/skills/publish-to-wiki"
+# --- 1. install the team skills (every folder under skills/) ---
+# User-level (~/.claude/skills), so each one is available in every repo.
+for skill_dir in "$SCRIPT_DIR"/skills/*/; do
+  skill="$(basename "$skill_dir")"
+  rm -rf "$CLAUDE_DIR/skills/$skill"
+  cp -R "$skill_dir" "$CLAUDE_DIR/skills/$skill"
+  echo "✓ installed skill: ~/.claude/skills/$skill"
+done
 
 # --- 2. add the team instruction to user-global CLAUDE.md (idempotent) ---
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
