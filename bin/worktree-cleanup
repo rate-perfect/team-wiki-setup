@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""worktree-cleanup: find (and, with --apply, remove) git worktrees whose work is done.
+
+Claude sessions make a git worktree for each change. A session that ends before its PR merges never cleans
+up, so worktrees pile up. This script lists every linked worktree of the repos you give it and says REMOVE or
+KEEP (with the reasons). It removes nothing unless you pass --apply.
+
+A worktree is REMOVE only when all of these hold:
+  1. It is a linked worktree: not the main checkout, not locked, and its folder still exists.
+  2. It is on a branch (a detached HEAD is kept).
+  3. That branch's GitHub PR is MERGED and the worktree HEAD is that PR's last commit (headRefOid), so there
+     are no commits after the merge. (Repos squash-merge, so "is it in the default branch" does not work.)
+  4. git status --porcelain is empty: no changes and no untracked files (ignored files are fine).
+  5. No open PR uses the branch.
+  6. No running process has its current folder inside the worktree (another session may be using it).
+Anything it cannot check (no GitHub remote, gh fails, offline, lsof fails) counts as KEEP, with the reason.
+If the process check (lsof) cannot run, every worktree is KEEP unless you pass --no-process-check.
+
+--apply runs, for each REMOVE: git worktree remove <path> (never --force), then git branch -D <branch>
+(-D because a squash-merged branch is not "merged" to git). Then git worktree prune for each repo.
+Remote branches are never touched.
+
+Usage:
+  worktree-cleanup [--apply] [--no-process-check] [--parent DIR ...] [REPO ...]
+
+  REPO          a git repo (or any of its worktrees). Repeat for more repos.
+  --parent DIR  check every git repo directly inside DIR (and DIR itself if it is a repo). Sibling
+                worktree folders (../<repo>-<name>) are matched back to their repo, so each repo shows once.
+
+Needs python3, git, gh (logged in) and lsof (macOS has it). Exit code: 0 ok, 1 an --apply step failed,
+2 bad usage.
+
+Distributed by https://github.com/rate-perfect/team-wiki-setup (install.sh). Change it there, not in
+~/.claude/bin.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+ENV = dict(os.environ, LC_ALL="C", GIT_OPTIONAL_LOCKS="0", GH_PROMPT_DISABLED="1", GIT_TERMINAL_PROMPT="0")
+GITHUB_URL = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
+
+
+def run(cmd, cwd=None, timeout=60):
+    """Run a command. Returns (exit code, stdout, stderr). A missing program or a timeout is exit code 127."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, env=ENV, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+
+
+def git(repo, *args):
+    return run(["git", "-C", repo, *args])
+
+
+def first_line(text):
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    return lines[0][:160] if lines else "no message"
+
+
+# ---------- finding repos ----------
+
+def repo_key(path):
+    """The repo's shared git folder (the same for the main checkout and all its worktrees), or None."""
+    code, out, _ = git(path, "rev-parse", "--git-common-dir")
+    if code != 0:
+        return None
+    return os.path.realpath(os.path.join(path, out.strip()))
+
+
+def find_repos(repo_args, parent_args):
+    """Returns (list of repo paths, one per repo, list of warnings)."""
+    candidates, warnings = [], []
+    for path in repo_args:
+        candidates.append(os.path.abspath(path))
+    for parent in parent_args:
+        parent = os.path.abspath(parent)
+        if not os.path.isdir(parent):
+            warnings.append(f"--parent {parent}: not a folder")
+            continue
+        # Only folders that have their own .git entry. Running git in a plain folder would find the
+        # repo above it instead.
+        for name in sorted([""] + os.listdir(parent)):
+            sub = os.path.join(parent, name) if name else parent
+            if os.path.isdir(sub) and os.path.exists(os.path.join(sub, ".git")):
+                candidates.append(sub)
+    repos, seen = [], set()
+    for path in candidates:
+        key = repo_key(path)
+        if key is None:
+            warnings.append(f"{path}: not a git repo, skipped")
+        elif key not in seen:
+            seen.add(key)
+            repos.append(path)
+    return repos, warnings
+
+
+def list_worktrees(repo):
+    """Parses git worktree list --porcelain. The first entry is the main checkout."""
+    code, out, err = git(repo, "worktree", "list", "--porcelain")
+    if code != 0:
+        raise RuntimeError(f"git worktree list failed: {first_line(err)}")
+    worktrees, cur = [], None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            cur = {"path": line[len("worktree "):], "head": None, "branch": None,
+                   "locked": False, "prunable": False, "bare": False}
+            worktrees.append(cur)
+        elif cur is None:
+            continue
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]
+            cur["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+        elif line == "locked" or line.startswith("locked "):
+            cur["locked"] = True
+        elif line == "prunable" or line.startswith("prunable "):
+            cur["prunable"] = True
+        elif line == "bare":
+            cur["bare"] = True
+    return worktrees
+
+
+# ---------- the checks ----------
+
+def process_cwds():
+    """Current folders of running processes, as {real path: [process descriptions]}, or None if lsof failed."""
+    code, out, _ = run(["lsof", "-n", "-P", "-w", "-d", "cwd", "-F", "pcn"], timeout=120)
+    if code == 127 or not out.strip():
+        return None
+    cwds, pid, cmd = {}, "?", "?"
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid, cmd = line[1:], "?"
+        elif line.startswith("c"):
+            cmd = line[1:]
+        elif line.startswith("n"):
+            cwds.setdefault(os.path.realpath(line[1:]), []).append(f"{cmd} (pid {pid})")
+    return cwds
+
+
+def users_of(path, cwds):
+    real = os.path.realpath(path)
+    found = []
+    for cwd, procs in cwds.items():
+        if cwd == real or cwd.startswith(real + os.sep):
+            found.extend(procs)
+    return found
+
+
+def github_repo(repo, branch):
+    """("owner/name", None) for the branch's remote (or origin) on github.com, else (None, reason)."""
+    code, out, _ = git(repo, "config", "--get", f"branch.{branch}.remote")
+    remote = out.strip() if code == 0 and out.strip() not in ("", ".") else "origin"
+    code, out, _ = git(repo, "config", "--get", f"remote.{remote}.url")
+    if code != 0 or not out.strip():
+        return None, f"no remote '{remote}', so the PR can't be checked"
+    url = out.strip()
+    m = GITHUB_URL.search(url)
+    if not m:
+        # Show only the host. The full URL can hold a token.
+        host = re.sub(r"^[a-z+]+://", "", url).split("@")[-1].split("/")[0].split(":")[0]
+        return None, f"remote '{remote}' is not on GitHub ({host}), so the PR can't be checked"
+    return f"{m.group(1)}/{m.group(2)}", None
+
+
+def pr_reasons(slug, branch, head):
+    """Reasons to keep, from the branch's PRs on GitHub. An empty list means a merged PR matches HEAD."""
+    code, out, err = run(["gh", "pr", "list", "--repo", slug, "--head", branch, "--state", "all",
+                          "--limit", "100", "--json", "number,state,headRefOid"])
+    if code != 0:
+        return [f"gh pr list failed: {first_line(err)}"]
+    try:
+        prs = json.loads(out)
+    except ValueError:
+        return ["gh pr list gave output that is not JSON"]
+    reasons = [f"open PR #{p['number']}" for p in prs if p.get("state") == "OPEN"]
+    merged = [p for p in prs if p.get("state") == "MERGED"]
+    if not prs:
+        reasons.append("no PR for this branch")
+    elif not merged and not reasons:
+        reasons.append("PR not merged (" + ", ".join(f"#{p['number']} {p.get('state', '?').lower()}"
+                                                     for p in prs) + ")")
+    elif merged and not any(p.get("headRefOid") == head for p in merged):
+        nums = ", ".join(f"#{p['number']}" for p in merged)
+        reasons.append(f"HEAD is not the last commit of merged PR {nums} (commits after the merge?)")
+    return reasons
+
+
+def verdict(repo, wt, is_main, cwds):
+    """Returns (reasons to keep, note). No reasons means REMOVE."""
+    if is_main:
+        return ["main checkout"], ""
+    if wt["bare"]:
+        return ["bare repo"], ""
+    if wt["prunable"] or not os.path.isdir(wt["path"]):
+        return ["folder is gone (git worktree prune clears the entry)"], ""
+    reasons = []
+    if wt["locked"]:
+        reasons.append("locked")
+    if cwds is None:
+        reasons.append("could not check for running processes (lsof failed)")
+    elif cwds is not False:
+        users = users_of(wt["path"], cwds)
+        if users:
+            reasons.append("in use by " + ", ".join(users[:3]) + (" ..." if len(users) > 3 else ""))
+    code, out, err = git(wt["path"], "status", "--porcelain")
+    if code != 0:
+        reasons.append(f"git status failed: {first_line(err)}")
+    elif out.strip():
+        n = len(out.splitlines())
+        reasons.append(f"uncommitted changes or untracked files ({n})")
+    if not wt["branch"]:
+        reasons.append("detached HEAD (not on a branch)")
+        return reasons, ""
+    slug, why = github_repo(repo, wt["branch"])
+    if why:
+        reasons.append(why)
+        return reasons, ""
+    reasons.extend(pr_reasons(slug, wt["branch"], wt["head"]))
+    return reasons, "" if reasons else "PR merged, nothing after it"
+
+
+# ---------- main ----------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="worktree-cleanup",
+        description="List git worktrees whose PR is merged and nothing is left in them. Dry run unless --apply.")
+    ap.add_argument("repos", nargs="*", metavar="REPO", help="a git repo (or one of its worktrees)")
+    ap.add_argument("--parent", action="append", default=[], metavar="DIR",
+                    help="check every git repo directly inside DIR (repeatable)")
+    ap.add_argument("--apply", action="store_true", help="remove the REMOVE worktrees and their local branches")
+    ap.add_argument("--no-process-check", action="store_true",
+                    help="skip the lsof check for processes running inside a worktree (not recommended)")
+    args = ap.parse_args(argv)
+    if not args.repos and not args.parent:
+        ap.print_usage(sys.stderr)
+        print("worktree-cleanup: give at least one REPO or --parent DIR", file=sys.stderr)
+        return 2
+
+    print("Mode: " + ("APPLY (removing REMOVE worktrees)" if args.apply else "dry run (nothing is changed; "
+                                                                              "add --apply to remove)"))
+    if args.no_process_check:
+        cwds = False
+        print("Process check: OFF (--no-process-check). A worktree in use by another session may be removed.")
+    else:
+        cwds = process_cwds()
+        if cwds is None:
+            print("Process check: FAILED (lsof did not run). Every worktree is KEEP. Fix lsof, or pass "
+                  "--no-process-check to skip it.")
+        else:
+            print("Process check: ok (lsof)")
+
+    repos, warnings = find_repos(args.repos, args.parent)
+    for w in warnings:
+        print(f"Note: {w}")
+    totals = {"REMOVE": 0, "KEEP": 0, "removed": 0, "failed": 0}
+    for repo in repos:
+        print()
+        try:
+            worktrees = list_worktrees(repo)
+        except RuntimeError as e:
+            print(f"== {repo}\n   SKIP  {e}")
+            continue
+        main_path = worktrees[0]["path"] if worktrees else repo
+        print(f"== {main_path}")
+        counts = {"REMOVE": 0, "KEEP": 0}
+        to_remove = []
+        for i, wt in enumerate(worktrees):
+            reasons, note = verdict(main_path, wt, i == 0, cwds)
+            label = "KEEP" if reasons else "REMOVE"
+            counts[label] += 1
+            branch = wt["branch"] or "(detached)"
+            print(f"   {label:<6}  {wt['path']}  [{branch}]")
+            print("           " +("; ".join(reasons) if reasons else note))
+            if not reasons:
+                to_remove.append(wt)
+        print(f"   -- {counts['REMOVE']} REMOVE, {counts['KEEP']} KEEP")
+        totals["REMOVE"] += counts["REMOVE"]
+        totals["KEEP"] += counts["KEEP"]
+        if args.apply:
+            for wt in to_remove:
+                code, _, err = git(main_path, "worktree", "remove", wt["path"])
+                if code != 0:
+                    totals["failed"] += 1
+                    print(f"   FAILED  git worktree remove {wt['path']}: {first_line(err)}")
+                    continue
+                code, _, err = git(main_path, "branch", "-D", wt["branch"])
+                if code != 0:
+                    totals["failed"] += 1
+                    print(f"   removed {wt['path']}, but git branch -D {wt['branch']} failed: {first_line(err)}")
+                    continue
+                totals["removed"] += 1
+                print(f"   removed {wt['path']} and local branch {wt['branch']}")
+            code, _, err = git(main_path, "worktree", "prune")
+            if code != 0:
+                print(f"   git worktree prune failed: {first_line(err)}")
+
+    print()
+    print(f"Total: {len(repos)} repos, {totals['REMOVE']} REMOVE, {totals['KEEP']} KEEP")
+    if args.apply:
+        print(f"Removed {totals['removed']}, failed {totals['failed']}")
+        return 1 if totals["failed"] else 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
