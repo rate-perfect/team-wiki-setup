@@ -1,6 +1,6 @@
 ---
 name: publish-to-wiki
-description: Publish (mirror) a report, summary, doc, spec, analysis, dashboard, runbook, or self-contained HTML artifact to the perfecti.io Team Wiki (wiki.perfecti.io) so the team (or just the author, privately) can find it, and return the URL. Also how to SEARCH the wiki for an existing page across everyone's accounts before making a new one. Use as the default finishing step for shareable output — in addition to any local file/artifact. Not for scratch files, in-repo code changes, or secrets.
+description: Publish (mirror) a report, summary, doc, spec, analysis, dashboard, runbook, or self-contained HTML artifact to the perfecti.io Team Wiki (wiki.perfecti.io) so the team (or just the author, privately) can find it, and return the URL. Also how to SEARCH the wiki for an existing page across everyone's accounts before making a new one, and how to file a page under a topic (Topics, the wiki's opt-in page hierarchy) and keep that topic's parent page up to date. Use as the default finishing step for shareable output — in addition to any local file/artifact. Not for scratch files, in-repo code changes, or secrets.
 ---
 
 # Publish to (and search) the perfecti.io Team Wiki
@@ -23,7 +23,7 @@ curl -sS "$WIKI_PUBLISH_URL/api/pages?q=SEARCH%20TERMS" \
   -H "Authorization: Bearer $WIKI_PUBLISH_TOKEN"
 ```
 
-Returns `{ ok, count, pages: [{slug,title,summary,tags,author,created,updated,url}] }`
+Returns `{ ok, count, pages: [{slug,title,summary,tags,author,created,updated,url,parent?,placeholder?}] }`
 for matching **internal (team)** pages (all terms must match; omit `q` to list
 everything). If you find the page, give the user `https://wiki.perfecti.io` +
 its `url` instead of remaking it. (Private/owner-only pages never appear here.)
@@ -37,7 +37,7 @@ curl -sS "$WIKI_PUBLISH_URL/api/pages?slug=THE-SLUG" \
 ```
 
 Returns `{ ok:true, page:{slug,title,summary,tags,author,created,updated,url,
-format,body,visibility,owner?} }` — `body` is the raw stored source and
+format,body,visibility,owner?,parent?,placeholder?} }` — `body` is the raw stored source and
 `format` is `"markdown"` or `"html"`. A missing slug returns
 `{ ok:false, error:"not found" }` (HTTP 404). Use it to read back a page you
 found via search — e.g. to update or extend it, or to reuse its content.
@@ -83,10 +83,118 @@ secrets, or anything the user marks private/local-only.
   person you're doing this for. Use their name if you know it, else their email;
   if you truly can't tell, ask — the API rejects a publish with no author.
 - **body** — the Markdown text, or the full HTML document.
+- **slug** *(optional)* — leave it out for a new page (the wiki derives it from
+  the title). **Pass the existing slug whenever you republish a page you read
+  back**, because a page's slug does not always match its current title, and a
+  mismatch would create a second page instead of updating the first.
+- **parent** *(optional, internal/private only)* — the slug of the page to file
+  this one under in Topics. See the next section for how to choose it.
+
+## Topics (filing a page under a parent page)
+The wiki has one flat list of every page, plus **Topics**: an opt-in tree where a
+page names another page as its `parent`. People browse Topics to find everything
+about a subject in one place, so a page filed in the right spot is easier to find
+than one that only exists in the flat list. A page with no `parent` is simply not
+in the tree; nothing breaks.
+
+**See the tree.** Every page in the index carries its `parent` slug if it has
+one, so the tree can be read straight from the list:
+
+```bash
+curl -sS "$WIKI_PUBLISH_URL/api/pages?limit=500" \
+  -H "Authorization: Bearer $WIKI_PUBLISH_TOKEN" \
+| jq -r '.pages as $p
+    | ($p | map(select(.parent) | .parent) | unique) as $parents
+    | $p[] | select(.parent or (.slug | IN($parents[])))
+    | "\(.slug)\t<- \(.parent // "(top level)")\t\(.title)\(if .placeholder then "  [section]" else "" end)"'
+```
+
+Each line is `slug <- parent-slug  title`. `[section]` marks a placeholder: a
+page someone created only to group others, with no content of its own yet.
+
+**Choosing the parent — three cases:**
+
+1. **The user names a topic** ("put it under DocIQ", "file this with the
+   PP-StructureV3 pages"). Find the page they mean in the tree or by search and
+   pass its slug as `parent`. If nothing matches, say so and ask whether to
+   create a new section or publish unfiled; don't guess at a near miss.
+2. **The user doesn't say, and there is an obvious home.** Look at the tree and
+   at what the user has been working on in this session: the product, project,
+   experiment or series the page belongs to. If one existing topic is clearly
+   where a teammate would look for this page, file it there without asking, and
+   say where you put it in the same sentence as the URL so the user can object.
+   Pick the most specific topic that fits (the experiment's own section rather
+   than the product's top-level page). Sibling pages are the best evidence: if
+   the new page is the next in a series whose other pages share a parent, it
+   belongs with them.
+3. **No obvious home.** Publish it unfiled. That is the normal state for most
+   pages and costs nothing; a page filed in the wrong place is worse than an
+   unfiled one, because people stop trusting the tree. Don't create a new
+   section on your own initiative, and don't file a page under a loosely related
+   topic just because it's the closest one.
+
+Filing is easy to undo (the page has a **Move…** button), which is why case 2
+doesn't need a question first.
+
+**Creating a section.** Only when the user asks for a new topic or section.
+Publish a page with the section's title, a one-sentence body saying what belongs
+under it, `"placeholder": true`, and its own `parent` if it goes under an
+existing topic. `placeholder` keeps the empty section out of the flat list.
+Then publish the real page with the section's slug as its `parent`.
+
+**Republishing a filed page.** Leave `parent` out and the page stays where it is.
+Only send `parent` again to move it, and only move a page when asked. To take a
+page out of Topics, send `"parent": null`.
+
+**Limits.** Public pages have no parent. A private page can sit under a team
+page, but the shared token cannot see private pages, so it can't find or read a
+private parent. A page can't be filed under itself or under one of its own
+sub-pages; the API returns 400.
+
+## Keeping the parent page current
+A topic's parent page is often a summary of what sits under it: current status,
+headline numbers, a list of its pages, what is still open. When you publish a
+new page under a topic, or update a page that is already under one, that summary
+can go stale without anyone noticing. So after the publish succeeds, read the
+parent (`?slug=<parent>`) and check it against what you just published.
+
+- **A placeholder parent** (`placeholder: true`) states no facts. Leave it alone.
+  Don't fill it in unless the user asks for a summary; doing so turns it into a
+  normal page.
+- **Look for statements the new page changes:** a status ("not yet tested"), a
+  number or date the new page supersedes, an open item the new page closes, a
+  "latest" or "next step" that is no longer the latest, and any list of the
+  topic's pages that should now include this one.
+- **If nothing is affected, do nothing.** Most publishes won't touch the parent.
+  Don't republish it just to reword it.
+
+How to correct it depends on what kind of document the parent is:
+
+- **A living summary or status page** (it describes how things stand now):
+  replace the outdated statement with the current one, so the page reads as true
+  today. Update its page list and its "as of" date if it has one.
+- **A dated record** (a report, a decision, a write-up of a specific run or
+  meeting): the old statement was true when written and should stay. Add a short
+  dated note beside it pointing to the newer page, rather than rewriting what
+  was found at the time.
+- **If you can't tell, or the change is more than a few statements,** don't
+  rewrite. Tell the user what looks outdated and let them decide.
+
+When you do update the parent, republish it with everything else unchanged: the
+same `slug`, `title`, `format`, `visibility`, `tags`, `summary` and `author`
+(keep the original author; you are correcting their page, not taking it over).
+Leave `parent` out so it stays where it is. For an HTML parent, edit the
+specific text in the existing document rather than regenerating the page. Change
+only what the new page makes wrong, and keep the parent's wording and structure
+otherwise.
+
+Then tell the user, alongside the new page's URL, which statements you changed
+in the parent and why, or which ones you left for them to decide.
 
 ## How to publish
 Write the body to a temp file to avoid shell-escaping issues, then POST it
-(`$OWNER` empty for non-private pages):
+(`$OWNER` empty for non-private pages; `$SLUG` empty for a new page; `$PARENT`
+empty to leave the page's place in Topics as it is, or `-` to take it out):
 
 ```bash
 # body already written to "$BODY_FILE"
@@ -97,21 +205,28 @@ jq -n \
   --arg summary "$SUMMARY" \
   --arg author "$AUTHOR" \
   --arg owner "$OWNER" \
+  --arg slug "$SLUG" \
+  --arg parent "$PARENT" \
   --rawfile body "$BODY_FILE" \
   --argjson tags "$TAGS_JSON" \
   '{title:$title, visibility:$visibility, format:$format, summary:$summary, author:$author, tags:$tags, body:$body}
-   + (if $owner == "" then {} else {owner:$owner} end)' \
+   + (if $owner == "" then {} else {owner:$owner} end)
+   + (if $slug == "" then {} else {slug:$slug} end)
+   + (if $parent == "" then {} elif $parent == "-" then {parent:null} else {parent:$parent} end)' \
 | curl -sS -X POST "$WIKI_PUBLISH_URL/api/publish" \
     -H "Authorization: Bearer $WIKI_PUBLISH_TOKEN" \
     -H "Content-Type: application/json" \
     --data @-
 ```
 
-`TAGS_JSON` is a JSON array, e.g. `["planning","q3"]` (use `[]` if none).
+`TAGS_JSON` is a JSON array, e.g. `["planning","q3"]` (use `[]` if none). For a
+new section page, also add `+ {placeholder:true}` to the object.
 
 ## After publishing
 The API returns `{ "ok": true, "url": "/wiki/<slug>" | "/p/<id>", ... }`.
-Give the user the full URL: `https://wiki.perfecti.io` + that path. A `private`
+Give the user the full URL: `https://wiki.perfecti.io` + that path. The response
+includes `parent` when the page is filed; say which topic it went under, and
+then do the parent check above. A `private`
 page's URL works only for its owner while signed in. If it returns `ok:false`,
 report the error (401 = token wrong/unset; 400 = missing field, e.g. `owner`
 required for a private page; 501/GitHub error = the server publish credential
