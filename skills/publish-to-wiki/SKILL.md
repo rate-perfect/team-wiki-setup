@@ -106,35 +106,58 @@ curl -sS "$WIKI_PUBLISH_URL/api/pages?limit=500" \
 | jq -r '.pages as $p
     | ($p | map(select(.parent) | .parent) | unique) as $parents
     | $p[] | select(.parent or (.slug | IN($parents[])))
-    | "\(.slug)\t<- \(.parent // "(top level)")\t\(.title)\(if .placeholder then "  [section]" else "" end)"'
+    | "\(.slug)\t<- \(.parent // "(top level)")\t\(.title)\(if .placeholder then "  [section]" else "" end)\t(\(.author))"'
 ```
 
-Each line is `slug <- parent-slug  title`. `[section]` marks a placeholder: a
-page someone created only to group others, with no content of its own yet.
+Each line is `slug <- parent-slug  title  (author)`. `[section]` marks a
+placeholder: a page someone created only to group others, with no content of its
+own yet.
 
-**Choosing the parent — three cases:**
+**Topics is opt-in for people as well as pages.** Some of the team organise
+their work in Topics and want new pages to land in the right place without
+having to ask each time. Others never use it, and for them it should stay out of
+the way entirely. So first work out which kind of user this is. Treat them as a
+**Topics user** if any of these is true:
 
-1. **The user names a topic** ("put it under DocIQ", "file this with the
+- they have mentioned Topics, a topic, a section or filing in this session, or
+  asked for a page to go "under" or "with" something;
+- their instructions or your memory of them say they use Topics;
+- pages they authored are already filed (their name appears in the tree above).
+
+Otherwise treat them as someone who doesn't use it. Running the tree command to
+check the last point is fine: it is one quick read and the user never sees it.
+
+**For a Topics user, lean towards filing.**
+
+1. **They name a topic** ("put it under DocIQ", "file this with the
    PP-StructureV3 pages"). Find the page they mean in the tree or by search and
    pass its slug as `parent`. If nothing matches, say so and ask whether to
    create a new section or publish unfiled; don't guess at a near miss.
-2. **The user doesn't say, and there is an obvious home.** Look at the tree and
-   at what the user has been working on in this session: the product, project,
-   experiment or series the page belongs to. If one existing topic is clearly
-   where a teammate would look for this page, file it there without asking, and
-   say where you put it in the same sentence as the URL so the user can object.
-   Pick the most specific topic that fits (the experiment's own section rather
-   than the product's top-level page). Sibling pages are the best evidence: if
-   the new page is the next in a series whose other pages share a parent, it
-   belongs with them.
-3. **No obvious home.** Publish it unfiled. That is the normal state for most
-   pages and costs nothing; a page filed in the wrong place is worse than an
-   unfiled one, because people stop trusting the tree. Don't create a new
-   section on your own initiative, and don't file a page under a loosely related
-   topic just because it's the closest one.
+2. **They don't say, and there is a logical place.** Look at the tree and at
+   what they have been working on in this session: the product, project,
+   experiment or series the page belongs to. If an existing topic is where a
+   teammate would reasonably look for this page, file it there without asking,
+   and say where it went in the same sentence as the URL. Pick the most specific
+   topic that fits (the experiment's own section rather than the product's
+   top-level page). Sibling pages are the best evidence: the next page in a
+   series belongs with the rest of the series. When two topics are both
+   plausible, pick the better one and name the other, rather than asking.
+3. **There is no logical place.** Publish it unfiled and say so in a few words,
+   so they can file it or ask for a new section. Don't create a section on your
+   own initiative, and don't stretch a loosely related topic to fit.
 
-Filing is easy to undo (the page has a **Move…** button), which is why case 2
-doesn't need a question first.
+Filing is easy to undo (the page has a **Move…** button), which is why a wrong
+guess here costs little and a question each time would cost more.
+
+**For someone who doesn't use Topics, stay out of the way.** Publish exactly as
+before: no `parent`, no mention of Topics, no question about where the page
+belongs, no offer to file it. Two things still
+happen on their behalf, quietly, because they keep other people's work intact:
+
+- a page that is already filed keeps its place when they republish it (leave
+  `parent` out, as always);
+- if they explicitly name a topic, they have just opted in: treat them as a
+  Topics user from then on.
 
 **Creating a section.** Only when the user asks for a new topic or section.
 Publish a page with the section's title, a one-sentence body saying what belongs
@@ -155,8 +178,9 @@ sub-pages; the API returns 400.
 A topic's parent page is often a summary of what sits under it: current status,
 headline numbers, a list of its pages, what is still open. When you publish a
 new page under a topic, or update a page that is already under one, that summary
-can go stale without anyone noticing. So after the publish succeeds, read the
-parent (`?slug=<parent>`) and check it against what you just published.
+can go stale without anyone noticing. So after the publish succeeds, if the
+response includes a `parent`, read that page (`?slug=<parent>`) and check it
+against what you just published.
 
 - **A placeholder parent** (`placeholder: true`) states no facts. Leave it alone.
   Don't fill it in unless the user asks for a summary; doing so turns it into a
@@ -178,7 +202,9 @@ How to correct it depends on what kind of document the parent is:
   dated note beside it pointing to the newer page, rather than rewriting what
   was found at the time.
 - **If you can't tell, or the change is more than a few statements,** don't
-  rewrite. Tell the user what looks outdated and let them decide.
+  rewrite. Tell a Topics user what looks outdated and let them decide. For
+  someone who doesn't use Topics, leave the parent as it is rather than handing
+  them a question about a page they never asked about.
 
 When you do update the parent, republish it with everything else unchanged: the
 same `slug`, `title`, `format`, `visibility`, `tags`, `summary` and `author`
@@ -189,7 +215,11 @@ only what the new page makes wrong, and keep the parent's wording and structure
 otherwise.
 
 Then tell the user, alongside the new page's URL, which statements you changed
-in the parent and why, or which ones you left for them to decide.
+in the parent and why, or which ones you left for them to decide. Keep it to a
+line or two. This check only ever runs for a page that is filed, so someone who
+doesn't use Topics meets it only when they update a page that somebody else
+filed; for them, make the clear-cut correction, mention it in one line, and ask
+nothing.
 
 ## How to publish
 Write the body to a temp file to avoid shell-escaping issues, then POST it
