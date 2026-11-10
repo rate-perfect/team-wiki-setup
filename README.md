@@ -117,7 +117,7 @@ worktree that has any ignored file that is not on its rebuildable list, and
 names the first few. A `.env`, a `terraform.tfvars` or a notes file keeps it.
 The rebuildable list (the `REBUILDABLE` constant in the script) is:
 `node_modules/`, `.next/`, `.expo/`, `dist/`, `build/`, `src/generated/`,
-`.terraform/`, `__pycache__/`, `.venv/`, `*.egg-info/`, `.mypy_cache/`,
+`.terraform/`, `coverage/`, `__pycache__/`, `.venv/`, `*.egg-info/`, `.mypy_cache/`,
 `.pytest_cache/`, `.ruff_cache/`, `htmlcov/`, `next-env.d.ts`,
 `expo-env.d.ts`, `*.tsbuildinfo` and `.coverage`. .NET `bin/` and `obj/` are
 not on it, because `bin/` often holds hand-written scripts.

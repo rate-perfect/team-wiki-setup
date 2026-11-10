@@ -82,7 +82,7 @@ class Fixture:
         os.makedirs(path)
         self.git(path, "init", "-q", "-b", "main")
         with open(os.path.join(path, ".gitignore"), "w") as f:
-            f.write("*.log\n*.tfvars\n.terraform/\nnode_modules/\n*.tsbuildinfo\nbuild/\n.claude/\n")
+            f.write("*.log\n*.tfvars\n.terraform/\nnode_modules/\n*.tsbuildinfo\nbuild/\n.claude/\ncoverage/\n")
         with open(os.path.join(path, "a.txt"), "w") as f:
             f.write("a\n")
         self.git(path, "add", ".")
@@ -161,6 +161,7 @@ class DryRunTest(unittest.TestCase):
         fx.prs("ignored", merged(sha))
         write(os.path.join(p["ignored"], "node_modules", "x", "index.js"))
         write(os.path.join(p["ignored"], "tsconfig.tsbuildinfo"))
+        write(os.path.join(p["ignored"], "coverage", "lcov.info"))
         p["tfvars"], sha = fx.worktree("tfvars")
         fx.prs("tfvars", merged(sha))
         write(os.path.join(p["tfvars"], "infra", "azure", ".terraform", "providers.txt"))
@@ -411,10 +412,11 @@ class RebuildableTest(unittest.TestCase):
         for path in ["node_modules/", "apps/mobile/node_modules/", "apps/mobile/.expo/", ".next/", "next-env.d.ts",
                      "tsconfig.tsbuildinfo", "infra/azure/.terraform/", "src/generated/", "web/src/generated/",
                      "src/generated/api.ts", "pkg.egg-info/", "api/__pycache__/", ".venv/", ".coverage",
-                     "dist/index.js"]:
+                     "dist/index.js", "coverage/", "web/coverage/lcov.info"]:
             self.assertTrue(mod.rebuildable(path), path)
         for path in [".env", "infra/azure/terraform.tfvars", "generated/", "notes.md", "bin/", "obj/",
-                     ".claude/", "node_modules", "next-env.d.ts/", "build.log"]:
+                     ".claude/", "node_modules", "next-env.d.ts/", "build.log",
+                     "prisma/dbml/", ".cache/", ".integration/", "coverage"]:
             self.assertFalse(mod.rebuildable(path), path)
 
 
