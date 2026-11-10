@@ -22,5 +22,7 @@ Publish **internal** without a prompt (just mention you're doing it). **Confirm 
 
 Don't publish pure scratch/throwaway output, in-repo code changes, or secrets.
 
+**Topics.** The wiki also has **Topics**, an opt-in tree where a page is filed under a parent page. For people who use it (they mention topics or filing, or their own pages are already filed), lean towards filing: put a new page under the topic they name, or under the logical existing topic for what you've been working on, and say where it went. For people who don't use it, publish as usual and don't bring it up. After publishing a filed page, check whether its parent page states anything the new page makes outdated. The `publish-to-wiki` skill has the details.
+
 **How:** use the `publish-to-wiki` skill (or `/publish-to-wiki`). If publishing isn't configured yet (`WIKI_PUBLISH_TOKEN` unset), tell the user to run the team-wiki `install.sh`.
 <!-- END perfecti-team-wiki -->
