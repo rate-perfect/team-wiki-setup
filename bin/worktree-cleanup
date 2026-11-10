@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""worktree-cleanup: find (and, with --apply, remove) git worktrees whose work is done.
+
+Claude sessions make a git worktree for each change. A session that ends before its PR merges never cleans
+up, so worktrees pile up. This script lists every linked worktree of the repos you give it and says REMOVE or
+KEEP (with the reasons). It removes nothing unless you pass --apply.
+
+A worktree is REMOVE only when all of these hold:
+  1. It is a linked worktree: not the main checkout, not locked, and its folder still exists.
+  2. It is inside the folders you scanned (see --include-outside).
+  3. It is on a branch (a detached HEAD is kept).
+  4. That branch's GitHub PR is MERGED into the repo's default branch, and the worktree HEAD is that PR's last
+     commit (headRefOid), so there are no commits after the merge. (Repos squash-merge, so "is it in the
+     default branch" does not work.)
+  5. git status is empty (untracked files and submodules included), and no file is marked skip-worktree or
+     assume-unchanged (those hide local edits from git status).
+  6. Every ignored file in it is on the REBUILDABLE list below. Removing a worktree DELETES its ignored files,
+     so anything else (a .env, a terraform.tfvars, notes) means KEEP. A folder on the list counts only when
+     it holds no tracked files, so an ignored build/.env in a tracked build/ folder means KEEP.
+  7. No other worktree or git repo (any .git file or folder) is inside it. In node_modules it looks only at
+     node_modules/<pkg>/ and node_modules/@scope/<pkg>/ (walking all of node_modules is too slow).
+  8. No open PR uses the branch.
+  9. No running process has its current folder inside the worktree (lsof). This only sees a process whose
+     current folder is inside it. A session that works there by full path from elsewhere is not seen.
+Anything it cannot check (no GitHub remote, gh fails, offline, lsof fails) counts as KEEP, with the reason.
+If the process check (lsof) cannot run, every worktree is KEEP unless you pass --no-process-check.
+
+--apply, for each REMOVE: first checks again (lsof, status, ignored files, nested repos, and that HEAD and the
+branch still point at the checked commit). Then git worktree remove <path> (never --force), then
+git update-ref -d refs/heads/<branch> <checked commit>, which deletes the local branch only if it still points
+at that commit, and git config --remove-section branch.<branch>. Then git worktree prune for each repo.
+Remote branches are never touched. Stashes are shared by all worktrees and are kept. The worktree's and
+branch's reflogs are gone after a remove.
+
+Usage:
+  worktree-cleanup [--apply] [--no-process-check] [--include-outside] [--parent DIR ...] [REPO ...]
+
+  REPO          a git repo (or any of its worktrees). Repeat for more repos.
+  --parent DIR  check every git repo directly inside DIR (and DIR itself if it is a repo). Sibling
+                worktree folders (../<repo>-<name>) are matched back to their repo, so each repo shows once.
+  Only worktrees inside a --parent DIR, or inside the folder that holds a REPO, can be REMOVE. Others are
+  KEEP unless you pass --include-outside.
+
+Needs python3, git, gh (logged in) and lsof (macOS has it). Exit code: 0 ok, 1 an --apply step failed or was
+skipped, 2 bad usage.
+
+Distributed by https://github.com/rate-perfect/team-wiki-setup (install.sh). Change it there, not in
+~/.claude/bin.
+"""
+import argparse
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+
+ENV = dict(os.environ, LC_ALL="C", GIT_OPTIONAL_LOCKS="0", GH_PROMPT_DISABLED="1", GIT_TERMINAL_PROMPT="0")
+GITHUB_URL = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
+
+# Ignored files that are safe to delete, because a build or install makes them again. A pattern ending in /
+# is a folder at any depth (src/generated/ means a src folder holding a generated folder). It counts only when
+# that folder holds no tracked files: a tracked build/ can hold a hand-written ignored file, such as build/.env.
+# Any other pattern is a file name at any depth. An ignored file that matches none of these keeps the worktree.
+# .NET bin/ and obj/ are left out on purpose: bin/ often holds hand-written scripts, and the .NET repos are on
+# Azure DevOps, which this script can't check, so they are kept anyway.
+REBUILDABLE = [
+    "node_modules/", ".next/", ".expo/", "dist/", "build/", "src/generated/", ".terraform/", "coverage/",
+    "__pycache__/", ".venv/", "*.egg-info/", ".mypy_cache/", ".pytest_cache/", ".ruff_cache/", "htmlcov/",
+    "next-env.d.ts", "expo-env.d.ts", "*.tsbuildinfo", ".coverage",
+]
+# The search for nested repos does not walk all of node_modules (too slow). It looks only for a .git directly
+# in node_modules/<pkg>/ and node_modules/@scope/<pkg>/, where a hand-made or linked package would be.
+
+
+def run(cmd, cwd=None, timeout=60):
+    """Run a command. Returns (exit code, stdout, stderr). A missing program or a timeout is exit code 127."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, env=ENV, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+
+
+def git(repo, *args):
+    return run(["git", "-C", repo, *args])
+
+
+def first_line(text):
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    return lines[0][:160] if lines else "no message"
+
+
+def inside(path, root):
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+# ---------- finding repos ----------
+
+def repo_key(path):
+    """The repo's shared git folder (the same for the main checkout and all its worktrees), or None."""
+    code, out, _ = git(path, "rev-parse", "--git-common-dir")
+    if code != 0:
+        return None
+    return os.path.realpath(os.path.join(path, out.strip()))
+
+
+def find_repos(repo_args, parent_args):
+    """Returns (repo paths, one per repo; scan roots; warnings)."""
+    candidates, roots, warnings = [], [], []
+    for path in repo_args:
+        path = os.path.abspath(path)
+        candidates.append(path)
+        code, out, _ = git(path, "rev-parse", "--show-toplevel")
+        top = out.strip() if code == 0 and out.strip() else path
+        roots.append(os.path.dirname(os.path.realpath(top)))
+    for parent in parent_args:
+        parent = os.path.abspath(parent)
+        if not os.path.isdir(parent):
+            warnings.append(f"--parent {parent}: not a folder")
+            continue
+        roots.append(os.path.realpath(parent))
+        # Only folders that have their own .git entry. Running git in a plain folder would find the
+        # repo above it instead.
+        for name in sorted([""] + os.listdir(parent)):
+            sub = os.path.join(parent, name) if name else parent
+            if os.path.isdir(sub) and os.path.exists(os.path.join(sub, ".git")):
+                candidates.append(sub)
+    repos, seen = [], set()
+    for path in candidates:
+        key = repo_key(path)
+        if key is None:
+            warnings.append(f"{path}: not a git repo, skipped")
+        elif key not in seen:
+            seen.add(key)
+            repos.append(path)
+    return repos, roots, warnings
+
+
+def list_worktrees(repo):
+    """Parses git worktree list --porcelain. The first entry is the main checkout."""
+    code, out, err = git(repo, "worktree", "list", "--porcelain")
+    if code != 0:
+        raise RuntimeError(f"git worktree list failed: {first_line(err)}")
+    worktrees, cur = [], None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            cur = {"path": line[len("worktree "):], "head": None, "branch": None,
+                   "locked": False, "prunable": False, "bare": False}
+            worktrees.append(cur)
+        elif cur is None:
+            continue
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]
+            cur["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+        elif line == "locked" or line.startswith("locked "):
+            cur["locked"] = True
+        elif line == "prunable" or line.startswith("prunable "):
+            cur["prunable"] = True
+        elif line == "bare":
+            cur["bare"] = True
+    return worktrees
+
+
+# ---------- the local checks ----------
+
+def process_cwds():
+    """Current folders of running processes, as {real path: [process descriptions]}, or None if lsof failed."""
+    code, out, _ = run(["lsof", "-n", "-P", "-w", "-d", "cwd", "-F", "pcn"], timeout=120)
+    if code == 127 or not out.strip():
+        return None
+    cwds, pid, cmd = {}, "?", "?"
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid, cmd = line[1:], "?"
+        elif line.startswith("c"):
+            cmd = line[1:]
+        elif line.startswith("n"):
+            cwds.setdefault(os.path.realpath(line[1:]), []).append(f"{cmd} (pid {pid})")
+    return cwds
+
+
+def process_reasons(path, cwds):
+    if cwds is False:      # --no-process-check
+        return []
+    if cwds is None:
+        return ["could not check for running processes (lsof failed)"]
+    real = os.path.realpath(path)
+    users = [p for cwd, procs in cwds.items() if inside(cwd, real) for p in procs]
+    if users:
+        return ["in use by " + ", ".join(users[:3]) + (" ..." if len(users) > 3 else "")]
+    return []
+
+
+def rebuildable(path, tracked_dirs=frozenset()):
+    """True if an ignored path (from git ls-files, folders end in /) matches the REBUILDABLE list.
+    tracked_dirs: folders that hold tracked files (at any depth). A folder pattern there does not count."""
+    is_dir = path.endswith("/")
+    parts = path.rstrip("/").split("/")
+    folders = parts if is_dir else parts[:-1]
+    for pattern in REBUILDABLE:
+        if pattern.endswith("/"):
+            want = pattern.rstrip("/").split("/")
+            for i in range(len(folders) - len(want) + 1):
+                if all(fnmatch.fnmatchcase(folders[i + j], w) for j, w in enumerate(want)) and \
+                        "/".join(folders[:i + len(want)]) not in tracked_dirs:
+                    return True
+        elif not is_dir and fnmatch.fnmatchcase(parts[-1], pattern):
+            return True
+    return False
+
+
+def show(items, n=3):
+    return ", ".join(items[:n]) + (f" (+{len(items) - n} more)" if len(items) > n else "")
+
+
+def files_reasons(path):
+    """Changes, hidden changes and ignored files that are not rebuildable."""
+    reasons = []
+    code, out, err = git(path, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
+    if code != 0:
+        reasons.append(f"git status failed: {first_line(err)}")
+    elif out.strip():
+        reasons.append(f"uncommitted changes or untracked files ({len(out.splitlines())})")
+    tracked_dirs = None
+    code, out, err = git(path, "ls-files", "-v", "-z")
+    if code != 0:
+        reasons.append(f"git ls-files -v failed: {first_line(err)}")
+    else:
+        tracked_dirs = set()
+        for entry in out.split("\0"):
+            parts = entry[2:].split("/")[:-1]
+            tracked_dirs.update("/".join(parts[:n]) for n in range(1, len(parts) + 1))
+        hidden = [e[2:] for e in out.split("\0") if e and (e[0] == "S" or e[0].islower())]
+        if hidden:
+            reasons.append(f"files marked skip-worktree or assume-unchanged: {show(hidden)}")
+    code, out, err = git(path, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z")
+    if tracked_dirs is None:
+        pass  # can't tell which folders are tracked; the ls-files -v reason above already keeps it
+    elif code != 0:
+        reasons.append(f"could not list ignored files: {first_line(err)}")
+    else:
+        found = [p for p in out.split("\0") if p]
+        # git can list a folder and also files inside it. Only the innermost entries count.
+        leaves = [p for p in found if not (p.endswith("/") and any(o != p and o.startswith(p) for o in found))]
+        keep = [p for p in leaves if not rebuildable(p, tracked_dirs)]
+        if keep:
+            reasons.append(f"ignored files that would be deleted: {show(keep)}")
+    return reasons
+
+
+def nested_reasons(path, all_paths, walk):
+    """Another worktree, or any .git file or folder, inside this worktree. walk=False skips the slow folder walk."""
+    real = os.path.realpath(path)
+    for other in all_paths:
+        if other != real and inside(other, real):
+            return [f"another worktree is inside it ({os.path.relpath(other, real)})"]
+    if not walk:
+        return []
+    for dirpath, dirnames, filenames in os.walk(real):
+        if dirpath != real and (".git" in dirnames or ".git" in filenames):
+            return [f"a git repo or worktree is inside it ({os.path.relpath(dirpath, real)})"]
+        if "node_modules" in dirnames:
+            found = node_modules_repo(os.path.join(dirpath, "node_modules"))
+            if found:
+                return [f"a git repo or worktree is inside it ({os.path.relpath(found, real)})"]
+        dirnames[:] = [d for d in dirnames if d not in ("node_modules", ".git")]
+    return []
+
+
+def node_modules_repo(folder):
+    """A package folder in node_modules/<pkg>/ or node_modules/@scope/<pkg>/ that holds a .git, or None."""
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    pkgs = []
+    for name in names:
+        sub = os.path.join(folder, name)
+        if name.startswith("@") and os.path.isdir(sub) and not os.path.islink(sub):
+            try:
+                pkgs += [os.path.join(sub, n) for n in sorted(os.listdir(sub))]
+            except OSError:
+                pass
+        else:
+            pkgs.append(sub)
+    for pkg in pkgs:
+        if not os.path.islink(pkg) and os.path.lexists(os.path.join(pkg, ".git")):
+            return pkg
+    return None
+
+
+# ---------- the GitHub checks ----------
+
+def github_repo(repo, branch):
+    """("owner/name", None) for the branch's remote (or origin) on github.com, else (None, reason)."""
+    code, out, _ = git(repo, "config", "--get", f"branch.{branch}.remote")
+    remote = out.strip() if code == 0 and out.strip() not in ("", ".") else "origin"
+    code, out, _ = git(repo, "config", "--get", f"remote.{remote}.url")
+    if code != 0 or not out.strip():
+        return None, f"no remote '{remote}', so the PR can't be checked"
+    url = out.strip()
+    m = GITHUB_URL.search(url)
+    if not m:
+        # Show only the host. The full URL can hold a token.
+        host = re.sub(r"^[a-z+]+://", "", url).split("@")[-1].split("/")[0].split(":")[0]
+        return None, f"remote '{remote}' is not on GitHub ({host}), so the PR can't be checked"
+    return f"{m.group(1)}/{m.group(2)}", None
+
+
+_default_branch = {}
+
+
+def default_branch(slug):
+    """(name, None) or (None, reason). Cached per repo."""
+    if slug not in _default_branch:
+        code, out, err = run(["gh", "repo", "view", slug, "--json", "defaultBranchRef"])
+        try:
+            name = json.loads(out)["defaultBranchRef"]["name"] if code == 0 else None
+        except (ValueError, KeyError, TypeError):
+            name = None
+        _default_branch[slug] = (name, None) if name else \
+            (None, f"could not get the default branch: {first_line(err) if code else 'bad output'}")
+    return _default_branch[slug]
+
+
+def pr_reasons(slug, branch, head):
+    """Reasons to keep, from the branch's PRs on GitHub. An empty list means a merged PR matches HEAD."""
+    code, out, err = run(["gh", "pr", "list", "--repo", slug, "--head", branch, "--state", "all",
+                          "--limit", "100", "--json", "number,state,headRefOid,baseRefName"])
+    if code != 0:
+        return [f"gh pr list failed: {first_line(err)}"]
+    try:
+        prs = json.loads(out)
+    except ValueError:
+        return ["gh pr list gave output that is not JSON"]
+    reasons = [f"open PR #{p['number']}" for p in prs if p.get("state") == "OPEN"]
+    merged = [p for p in prs if p.get("state") == "MERGED"]
+    matching = [p for p in merged if p.get("headRefOid") == head]
+    if not prs:
+        reasons.append("no PR for this branch")
+    elif not merged and not reasons:
+        reasons.append("PR not merged (" + ", ".join(f"#{p['number']} {p.get('state', '?').lower()}"
+                                                     for p in prs) + ")")
+    elif merged and not matching:
+        nums = ", ".join(f"#{p['number']}" for p in merged)
+        reasons.append(f"HEAD is not the last commit of merged PR {nums} (commits after the merge?)")
+    elif matching:
+        default, why = default_branch(slug)
+        if why:
+            reasons.append(why)
+        elif not any(p.get("baseRefName") == default for p in matching):
+            bases = ", ".join(sorted({p.get("baseRefName") or "?" for p in matching}))
+            reasons.append(f"merged into {bases}, not {default}")
+    return reasons
+
+
+# ---------- verdicts ----------
+
+def verdict(repo, wt, is_main, cwds, all_paths, roots, include_outside):
+    """Returns the reasons to keep. An empty list means REMOVE."""
+    if is_main:
+        return ["main checkout"]
+    if wt["bare"]:
+        return ["bare repo"]
+    if wt["prunable"] or not os.path.isdir(wt["path"]):
+        return ["folder is gone (git worktree prune clears the entry)"]
+    reasons = []
+    real = os.path.realpath(wt["path"])
+    if not include_outside and not any(inside(real, root) for root in roots):
+        reasons.append("outside the scanned folders (use --include-outside to allow)")
+    if wt["locked"]:
+        reasons.append("locked")
+    reasons += process_reasons(wt["path"], cwds)
+    reasons += files_reasons(wt["path"])
+    reasons += nested_reasons(wt["path"], all_paths, walk=False)
+    if not wt["branch"]:
+        return reasons + ["detached HEAD (not on a branch)"]
+    slug, why = github_repo(repo, wt["branch"])
+    reasons += [why] if why else pr_reasons(slug, wt["branch"], wt["head"])
+    if not reasons:
+        # The folder walk is slow, so only for worktrees that passed everything else.
+        reasons += nested_reasons(wt["path"], all_paths, walk=True)
+    return reasons
+
+
+def recheck(repo, wt, all_paths, process_check):
+    """Just before removing: is the worktree still exactly as checked? Returns reasons to skip it."""
+    reasons = process_reasons(wt["path"], process_cwds() if process_check else False)
+    code, out, _ = git(wt["path"], "rev-parse", "HEAD")
+    if code != 0 or out.strip() != wt["head"]:
+        reasons.append("HEAD moved since the check")
+    code, out, _ = git(wt["path"], "symbolic-ref", "-q", "HEAD")
+    if code != 0 or out.strip() != f"refs/heads/{wt['branch']}":
+        reasons.append("no longer on the checked branch")
+    code, out, _ = git(repo, "rev-parse", "-q", "--verify", f"refs/heads/{wt['branch']}")
+    if code != 0 or out.strip() != wt["head"]:
+        reasons.append("branch moved since the check")
+    reasons += files_reasons(wt["path"])
+    reasons += nested_reasons(wt["path"], all_paths, walk=True)
+    return reasons
+
+
+# ---------- main ----------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="worktree-cleanup",
+        description="List git worktrees whose PR is merged and nothing is left in them. Dry run unless --apply.")
+    ap.add_argument("repos", nargs="*", metavar="REPO", help="a git repo (or one of its worktrees)")
+    ap.add_argument("--parent", action="append", default=[], metavar="DIR",
+                    help="check every git repo directly inside DIR (repeatable)")
+    ap.add_argument("--apply", action="store_true", help="remove the REMOVE worktrees and their local branches")
+    ap.add_argument("--no-process-check", action="store_true",
+                    help="skip the lsof check for processes running inside a worktree (not recommended)")
+    ap.add_argument("--include-outside", action="store_true",
+                    help="allow REMOVE for worktrees outside the --parent folders and the REPO folders")
+    args = ap.parse_args(argv)
+    if not args.repos and not args.parent:
+        ap.print_usage(sys.stderr)
+        print("worktree-cleanup: give at least one REPO or --parent DIR", file=sys.stderr)
+        return 2
+
+    print("Mode: " + ("APPLY (removing REMOVE worktrees)" if args.apply else "dry run (nothing is changed; "
+                                                                              "add --apply to remove)"))
+    if args.no_process_check:
+        cwds = False
+        print("Process check: OFF (--no-process-check). A worktree in use by another session may be removed.")
+    else:
+        cwds = process_cwds()
+        if cwds is None:
+            print("Process check: FAILED (lsof did not run). Every worktree is KEEP. Fix lsof, or pass "
+                  "--no-process-check to skip it.")
+        else:
+            print("Process check: ok (lsof)")
+
+    repos, roots, warnings = find_repos(args.repos, args.parent)
+    for w in warnings:
+        print(f"Note: {w}")
+    listed = []
+    for repo in repos:
+        try:
+            listed.append((repo, list_worktrees(repo), None))
+        except RuntimeError as e:
+            listed.append((repo, [], e))
+    # Every worktree path of every scanned repo, to find worktrees nested inside each other.
+    all_paths = {os.path.realpath(wt["path"]) for _, wts, _ in listed for wt in wts}
+
+    totals = {"REMOVE": 0, "KEEP": 0, "removed": 0, "failed": 0}
+    for repo, worktrees, error in listed:
+        print()
+        if error:
+            print(f"== {repo}\n   SKIP  {error}")
+            continue
+        main_path = worktrees[0]["path"] if worktrees else repo
+        print(f"== {main_path}")
+        counts = {"REMOVE": 0, "KEEP": 0}
+        to_remove = []
+        for i, wt in enumerate(worktrees):
+            reasons = verdict(main_path, wt, i == 0, cwds, all_paths, roots, args.include_outside)
+            label = "KEEP" if reasons else "REMOVE"
+            counts[label] += 1
+            print(f"   {label:<6}  {wt['path']}  [{wt['branch'] or '(detached)'}]")
+            print("           " + ("; ".join(reasons) if reasons else "PR merged, nothing after it"))
+            if not reasons:
+                to_remove.append(wt)
+        print(f"   -- {counts['REMOVE']} REMOVE, {counts['KEEP']} KEEP")
+        totals["REMOVE"] += counts["REMOVE"]
+        totals["KEEP"] += counts["KEEP"]
+        if args.apply:
+            for wt in to_remove:
+                why = recheck(main_path, wt, all_paths, not args.no_process_check)
+                if why:
+                    totals["failed"] += 1
+                    print(f"   SKIPPED {wt['path']}: {'; '.join(why)}")
+                    continue
+                code, _, err = git(main_path, "worktree", "remove", wt["path"])
+                if code != 0:
+                    totals["failed"] += 1
+                    print(f"   FAILED  git worktree remove {wt['path']}: {first_line(err)}")
+                    continue
+                code, _, err = git(main_path, "update-ref", "-d", f"refs/heads/{wt['branch']}", wt["head"])
+                if code != 0:
+                    totals["failed"] += 1
+                    print(f"   removed {wt['path']}, but kept branch {wt['branch']} (it moved?): {first_line(err)}")
+                    continue
+                # update-ref leaves branch.<name>.* (upstream and so on) in the config. "No such section" is fine.
+                code, _, err = git(main_path, "config", "--remove-section", f"branch.{wt['branch']}")
+                if code != 0 and "no such section" not in err.lower():
+                    print(f"   note: could not remove the config for branch {wt['branch']}: {first_line(err)}")
+                totals["removed"] += 1
+                print(f"   removed {wt['path']} and local branch {wt['branch']}")
+            code, _, err = git(main_path, "worktree", "prune")
+            if code != 0:
+                print(f"   git worktree prune failed: {first_line(err)}")
+
+    print()
+    print(f"Total: {len(repos)} repos, {totals['REMOVE']} REMOVE, {totals['KEEP']} KEEP")
+    if args.apply:
+        print(f"Removed {totals['removed']}, failed or skipped {totals['failed']}")
+        return 1 if totals["failed"] else 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

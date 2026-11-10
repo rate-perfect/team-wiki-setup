@@ -128,6 +128,20 @@ echo "✓ set WIKI_PUBLISH_URL + WIKI_PUBLISH_TOKEN in ~/.claude/settings.json (
 echo "✓ installed wiki-mirror reminder hook (PostToolUse · Artifact)"
 echo "✓ installed repo-rules-first hook (PreToolUse · Edit|Write|NotebookEdit|Bash)"
 
+# --- 5. copy the team tools (~/.claude/bin) ---
+# worktree-cleanup: lists git worktrees whose GitHub PR is merged and that hold
+# nothing else (no changes, no newer commits, no open PR, no running process,
+# no ignored files a build can't make again), and removes them only when you
+# pass --apply. Not a hook: you run it yourself.
+# ~/.claude/bin is not on your PATH; call it by its full path. Needs python3,
+# gh and lsof.
+mkdir -p "$CLAUDE_DIR/bin"
+for tool in worktree-cleanup; do
+  cp "$SCRIPT_DIR/bin/$tool" "$CLAUDE_DIR/bin/$tool"
+  chmod +x "$CLAUDE_DIR/bin/$tool"
+  echo "✓ installed tool: ~/.claude/bin/$tool"
+done
+
 echo
 echo "Done. Restart any open Claude Code sessions to pick up the changes"
 echo "(or run /hooks once to reload config in a running session)."
