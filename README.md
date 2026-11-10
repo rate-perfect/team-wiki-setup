@@ -78,7 +78,7 @@ copies `bin/worktree-cleanup` to `~/.claude/bin/worktree-cleanup`. You run it
 yourself; it is not a hook.
 
 ```bash
-# Dry run: list every worktree with REMOVE or KEEP and the reason. Changes nothing.
+# Dry run: list every worktree with REMOVE or KEEP and the reasons. Changes nothing.
 ~/.claude/bin/worktree-cleanup --parent ~/projects/rate-perfect-workspace
 ~/.claude/bin/worktree-cleanup ~/m3/deals-module-api ~/m3/deals-view
 
@@ -90,27 +90,62 @@ yourself; it is not a hook.
 - `--parent DIR` checks every git repo directly inside `DIR` (and `DIR`
   itself if it is a repo). Sibling worktree folders such as `../<repo>-<name>`
   are matched back to their repo, so each repo shows once.
+- Only worktrees inside a `--parent` folder, or inside the folder that holds a
+  `REPO`, can be removed. A repo can also have worktrees somewhere else (for
+  example in `/tmp`, or a repo in `~/m3` with a worktree in your workspace).
+  Those are KEEP, "outside the scanned folders". Pass `--include-outside` to
+  allow them.
 
 A worktree is REMOVE only when all of these are true:
 
 1. It is a linked worktree. It is not the main checkout and not locked.
 2. It is on a branch. A detached HEAD is kept.
-3. The branch's GitHub PR is merged, and the worktree's last commit is the
-   PR's last commit. So nothing was added after the merge. (Repos
-   squash-merge, so the script asks GitHub, not git.)
-4. `git status --porcelain` is empty: no changes and no untracked files.
-   Ignored files are fine.
-5. No open PR uses the branch.
-6. No running process has its current folder inside the worktree. Another
-   Claude session may still be working there. The script asks `lsof`.
+3. The branch's GitHub PR is merged into the repo's default branch, and the
+   worktree's last commit is the PR's last commit. So nothing was added after
+   the merge. (Repos squash-merge, so the script asks GitHub, not git.)
+4. `git status` is empty, untracked files and submodules included. No file is
+   marked skip-worktree or assume-unchanged (those hide edits from
+   `git status`).
+5. Every ignored file in it is rebuildable (see below).
+6. No other worktree or git repo (any `.git` file or folder) is inside it.
+7. No open PR uses the branch.
+8. No running process has its current folder inside the worktree. The script
+   asks `lsof`.
+
+**Removing a worktree deletes its ignored files.** So the script keeps a
+worktree that has any ignored file that is not on its rebuildable list, and
+names the first few. A `.env`, a `terraform.tfvars` or a notes file keeps it.
+The rebuildable list (the `REBUILDABLE` constant in the script) is:
+`node_modules/`, `.next/`, `.expo/`, `dist/`, `build/`, `src/generated/`,
+`.terraform/`, `__pycache__/`, `.venv/`, `*.egg-info/`, `.mypy_cache/`,
+`.pytest_cache/`, `.ruff_cache/`, `htmlcov/`, `next-env.d.ts`,
+`expo-env.d.ts`, `*.tsbuildinfo` and `.coverage`. .NET `bin/` and `obj/` are
+not on it, because `bin/` often holds hand-written scripts.
 
 If it can't check something, it keeps the worktree and says why. For example:
 no GitHub remote (Azure DevOps repos), `gh` failed, or you are offline. If
 `lsof` fails, it keeps every worktree. Pass `--no-process-check` to skip that
 check on purpose.
 
-With `--apply`, for each REMOVE it runs `git worktree remove` (never
-`--force`), then `git branch -D` on the local branch (`-D` because git does not
-see a squash-merged branch as merged). Then it runs `git worktree prune`. It
-never touches remote branches. Needs `python3`, `gh` (logged in) and `lsof`.
+The `lsof` check only sees a process whose current folder is inside the
+worktree. Claude sessions often work in a worktree by its full path from
+another folder, so the check rarely sees them. That is why `--apply` checks
+again just before each remove (next paragraph).
+
+With `--apply`, for each REMOVE it first checks again: `lsof`, `git status`,
+ignored files, nested repos, and that HEAD and the branch still point at the
+checked commit. If anything changed, it skips that worktree. Then it runs
+`git worktree remove` (never `--force`), then
+`git update-ref -d refs/heads/<branch> <checked commit>`, which deletes the
+local branch only if it still points at that commit. Then it runs
+`git worktree prune`. It never touches remote branches.
+
+Good to know before you run `--apply`:
+
+- Stashes are shared by all worktrees of a repo. They are kept when a worktree
+  is removed.
+- Removing a worktree and its branch also drops their reflogs. Commits that
+  were reset away in that worktree can no longer be found with `git reflog`.
+
+Needs `python3`, `gh` (logged in) and `lsof`.
 Tests: `python3 tests/test_worktree_cleanup.py`.

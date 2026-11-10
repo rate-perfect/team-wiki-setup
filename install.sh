@@ -130,8 +130,9 @@ echo "✓ installed repo-rules-first hook (PreToolUse · Edit|Write|NotebookEdit
 
 # --- 5. copy the team tools (~/.claude/bin) ---
 # worktree-cleanup: lists git worktrees whose GitHub PR is merged and that hold
-# nothing else (no changes, no newer commits, no open PR, no running process),
-# and removes them only when you pass --apply. Not a hook: you run it yourself.
+# nothing else (no changes, no newer commits, no open PR, no running process,
+# no ignored files a build can't make again), and removes them only when you
+# pass --apply. Not a hook: you run it yourself.
 # ~/.claude/bin is not on your PATH; call it by its full path. Needs python3,
 # gh and lsof.
 mkdir -p "$CLAUDE_DIR/bin"

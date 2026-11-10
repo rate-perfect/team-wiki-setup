@@ -4,6 +4,8 @@
 Each test builds throwaway repos and worktrees in a temp folder. Fake gh and lsof programs go first on PATH,
 so nothing talks to GitHub and no real process is looked at.
 """
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -18,8 +20,11 @@ SCRIPT = os.path.join(HERE, "..", "bin", "worktree-cleanup")
 FAKE_GH = r'''#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
-branch = args[args.index("--head") + 1]
 data = json.load(open(os.environ["FAKE_GH_FILE"]))
+if args[:2] == ["repo", "view"]:
+    print(json.dumps({"defaultBranchRef": {"name": data.get("__default__", "main")}}))
+    sys.exit(0)
+branch = args[args.index("--head") + 1]
 answer = data.get(branch, [])
 if answer == "fail":
     sys.stderr.write("error connecting to api.github.com\n")
@@ -28,9 +33,16 @@ print(json.dumps(answer))
 '''
 
 FAKE_LSOF = r'''#!/usr/bin/env python3
-import os, sys
+import os, subprocess, sys
 if os.environ.get("FAKE_LSOF_FAIL"):
     sys.exit(1)
+# FAKE_LSOF_HOOK: a shell command run once, on the second call (the re-check just before the first remove).
+counter = os.environ.get("FAKE_LSOF_COUNT")
+if counter:
+    n = int(open(counter).read() or 0) + 1 if os.path.exists(counter) else 1
+    open(counter, "w").write(str(n))
+    if n == 2 and os.environ.get("FAKE_LSOF_HOOK"):
+        subprocess.run(os.environ["FAKE_LSOF_HOOK"], shell=True, check=True)
 print("p1\ncinit\nn/")
 for i, path in enumerate(filter(None, os.environ.get("FAKE_LSOF_CWDS", "").split(":"))):
     print(f"p{100 + i}\ncclaude\nn{path}")
@@ -70,7 +82,7 @@ class Fixture:
         os.makedirs(path)
         self.git(path, "init", "-q", "-b", "main")
         with open(os.path.join(path, ".gitignore"), "w") as f:
-            f.write("*.log\n")
+            f.write("*.log\n*.tfvars\n.terraform/\nnode_modules/\n*.tsbuildinfo\nbuild/\n.claude/\n")
         with open(os.path.join(path, "a.txt"), "w") as f:
             f.write("a\n")
         self.git(path, "add", ".")
@@ -104,8 +116,14 @@ class Fixture:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
-def merged(sha, number=1):
-    return {"number": number, "state": "MERGED", "headRefOid": sha}
+def merged(sha, number=1, base="main"):
+    return {"number": number, "state": "MERGED", "headRefOid": sha, "baseRefName": base}
+
+
+def write(path, text=""):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
 
 
 def parse(output):
@@ -141,7 +159,46 @@ class DryRunTest(unittest.TestCase):
         open(os.path.join(p["untracked"], "new.txt"), "w").close()
         p["ignored"], sha = fx.worktree("ignored")
         fx.prs("ignored", merged(sha))
-        open(os.path.join(p["ignored"], "build.log"), "w").close()
+        write(os.path.join(p["ignored"], "node_modules", "x", "index.js"))
+        write(os.path.join(p["ignored"], "tsconfig.tsbuildinfo"))
+        p["tfvars"], sha = fx.worktree("tfvars")
+        fx.prs("tfvars", merged(sha))
+        write(os.path.join(p["tfvars"], "infra", "azure", ".terraform", "providers.txt"))
+        write(os.path.join(p["tfvars"], "infra", "azure", "terraform.tfvars"), "secret = 1\n")
+        p["log"], sha = fx.worktree("log")
+        fx.prs("log", merged(sha))
+        write(os.path.join(p["log"], "notes.log"))
+        # 1. nested worktrees and repos
+        p["outer"], sha = fx.worktree("outer")
+        fx.prs("outer", merged(sha))
+        p["inner"] = os.path.join(p["outer"], ".claude", "worktrees", "agent-x")
+        fx.git(fx.main, "worktree", "add", "-q", p["inner"], "-b", "feat/inner")
+        write(os.path.join(p["inner"], "UNSAVED.txt"), "work\n")
+        p["nestrepo"], sha = fx.worktree("nestrepo")
+        fx.prs("nestrepo", merged(sha))
+        fx.git(fx.tmp, "init", "-q", os.path.join(p["nestrepo"], "build", "vendor"))
+        p["nestfile"], sha = fx.worktree("nestfile")
+        fx.prs("nestfile", merged(sha))
+        other = os.path.join(fx.tmp, "other")
+        fx.git(fx.tmp, "init", "-q", "-b", "main", other)
+        fx.git(other, "commit", "-q", "--allow-empty", "-m", "base")
+        fx.git(other, "worktree", "add", "-q", os.path.join(p["nestfile"], "build", "otherwt"), "-b", "x")
+        # 4. git settings that hide changes
+        p["skipwt"], sha = fx.worktree("skipwt")
+        fx.prs("skipwt", merged(sha))
+        fx.git(p["skipwt"], "update-index", "--skip-worktree", "a.txt")
+        write(os.path.join(p["skipwt"], "a.txt"), "local edit\n")
+        p["assume"], sha = fx.worktree("assume")
+        fx.prs("assume", merged(sha))
+        fx.git(p["assume"], "update-index", "--assume-unchanged", "a.txt")
+        write(os.path.join(p["assume"], "a.txt"), "local edit\n")
+        # 6. a worktree outside the scanned folder
+        p["outside"] = os.path.join(fx.tmp, "elsewhere", "widgets-outside")
+        fx.git(fx.main, "worktree", "add", "-q", p["outside"], "-b", "feat/outside")
+        fx.prs("outside", merged(fx.git(p["outside"], "rev-parse", "HEAD")))
+        # 7. merged into a branch that is not the default
+        p["base"], sha = fx.worktree("base")
+        fx.prs("base", merged(sha, base="release"))
         p["open"], sha = fx.worktree("open")
         fx.prs("open", {"number": 3, "state": "OPEN", "headRefOid": sha})
         p["reopened"], sha = fx.worktree("reopened")
@@ -188,7 +245,7 @@ class DryRunTest(unittest.TestCase):
     def test_remove(self):
         self.check("done", "REMOVE")
         self.check("two", "REMOVE")      # an older merged PR, then the merged PR that matches HEAD
-        self.check("ignored", "REMOVE")  # ignored files don't count
+        self.check("ignored", "REMOVE")  # only rebuildable ignored files
 
     def test_keep_reasons(self):
         self.check("main", "KEEP", "main checkout")
@@ -206,6 +263,16 @@ class DryRunTest(unittest.TestCase):
         self.check("inuse", "KEEP", "in use by claude")
         self.check("gone", "KEEP", "folder is gone")
         self.check("ado", "KEEP", "not on GitHub (dev.azure.com)")
+        self.check("tfvars", "KEEP", "ignored files that would be deleted: infra/azure/terraform.tfvars")
+        self.check("log", "KEEP", "ignored files that would be deleted: notes.log")
+        self.check("outer", "KEEP", "another worktree is inside it (.claude/worktrees/agent-x)")
+        self.check("inner", "KEEP", "uncommitted changes")
+        self.check("nestrepo", "KEEP", "a git repo or worktree is inside it (build/vendor)")
+        self.check("nestfile", "KEEP", "a git repo or worktree is inside it (build/otherwt)")
+        self.check("skipwt", "KEEP", "skip-worktree or assume-unchanged: a.txt")
+        self.check("assume", "KEEP", "skip-worktree or assume-unchanged: a.txt")
+        self.check("outside", "KEEP", "outside the scanned folders")
+        self.check("base", "KEEP", "merged into release, not main")
 
     def test_each_repo_once_and_no_secret(self):
         self.assertEqual(self.proc.stdout.count("== "), 2, self.proc.stdout)  # widgets + adorepo, not notes
@@ -256,7 +323,7 @@ class ApplyTest(unittest.TestCase):
             open(os.path.join(dirty, "new.txt"), "w").close()
             p = fx.run("--apply", fx.main)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-            self.assertIn("Removed 1, failed 0", p.stdout)
+            self.assertIn("Removed 1, failed or skipped 0", p.stdout)
             self.assertFalse(os.path.exists(done))
             self.assertEqual(fx.git(fx.main, "branch", "--list", "feat/done"), "")
             self.assertEqual(fx.git(fx.main, "rev-parse", "refs/remotes/origin/feat/done"), sha)  # remote ref kept
@@ -270,6 +337,85 @@ class ApplyTest(unittest.TestCase):
     def test_usage_error(self):
         p = subprocess.run([sys.executable, SCRIPT], capture_output=True, text=True)
         self.assertEqual(p.returncode, 2)
+
+
+class SafetyTest(unittest.TestCase):
+    """Cases that each need their own fixture."""
+
+    def setUp(self):
+        self.fx = Fixture()
+
+    def tearDown(self):
+        self.fx.cleanup()
+
+    def verdict(self, proc, path):
+        return parse(proc.stdout)[os.path.realpath(path)]
+
+    def test_show_untracked_files_setting_is_ignored(self):
+        wt, sha = self.fx.worktree("u")
+        self.fx.prs("u", merged(sha))
+        self.fx.git(self.fx.main, "config", "status.showUntrackedFiles", "no")
+        write(os.path.join(wt, "NOTES.md"), "only copy\n")
+        verdict, why = self.verdict(self.fx.run(self.fx.main), wt)
+        self.assertEqual(verdict, "KEEP")
+        self.assertIn("untracked files", why)
+
+    def test_include_outside(self):
+        wt = os.path.join(self.fx.tmp, "elsewhere", "w")
+        self.fx.git(self.fx.main, "worktree", "add", "-q", wt, "-b", "feat/w")
+        self.fx.prs("w", merged(self.fx.git(wt, "rev-parse", "HEAD")))
+        self.assertEqual(self.verdict(self.fx.run(self.fx.main), wt)[0], "KEEP")
+        self.assertEqual(self.verdict(self.fx.run("--include-outside", self.fx.main), wt)[0], "REMOVE")
+
+    def test_apply_keeps_nested_worktree(self):
+        outer, sha = self.fx.worktree("outer")
+        self.fx.prs("outer", merged(sha))
+        inner = os.path.join(outer, ".claude", "worktrees", "agent-x")
+        self.fx.git(self.fx.main, "worktree", "add", "-q", inner, "-b", "feat/inner")
+        write(os.path.join(inner, "UNSAVED.txt"), "work\n")
+        p = self.fx.run("--apply", self.fx.main)
+        self.assertIn("Removed 0,", p.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(inner, "UNSAVED.txt")))
+
+    def race(self, hook):
+        """--apply where hook runs after the check, just before the remove. Returns (proc, worktree, sha)."""
+        wt, sha = self.fx.worktree("late")
+        self.fx.prs("late", merged(sha))
+        p = self.fx.run("--apply", self.fx.main, FAKE_LSOF_COUNT=os.path.join(self.fx.tmp, "lsof-count"),
+                        FAKE_LSOF_HOOK=hook.format(wt=wt))
+        return p, wt, sha
+
+    def test_race_late_commit(self):
+        p, wt, sha = self.race("cd {wt} && echo new > late.txt && git add late.txt && git commit -qm late")
+        self.assertIn("SKIPPED", p.stdout)
+        self.assertIn("HEAD moved since the check", p.stdout)
+        self.assertEqual(p.returncode, 1)
+        self.assertTrue(os.path.isfile(os.path.join(wt, "late.txt")))
+        self.assertNotEqual(self.fx.git(self.fx.main, "rev-parse", "feat/late"), sha)
+
+    def test_race_late_file(self):
+        p, wt, _ = self.race("echo new > {wt}/late.txt")
+        self.assertIn("SKIPPED", p.stdout)
+        self.assertIn("untracked files", p.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(wt, "late.txt")))
+        self.assertTrue(self.fx.git(self.fx.main, "branch", "--list", "feat/late"))
+
+
+class RebuildableTest(unittest.TestCase):
+    def test_patterns(self):
+        sys.dont_write_bytecode = True  # no __pycache__ next to bin/worktree-cleanup
+        loader = importlib.machinery.SourceFileLoader("worktree_cleanup", SCRIPT)
+        spec = importlib.util.spec_from_loader("worktree_cleanup", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        for path in ["node_modules/", "apps/mobile/node_modules/", "apps/mobile/.expo/", ".next/", "next-env.d.ts",
+                     "tsconfig.tsbuildinfo", "infra/azure/.terraform/", "src/generated/", "web/src/generated/",
+                     "src/generated/api.ts", "pkg.egg-info/", "api/__pycache__/", ".venv/", ".coverage",
+                     "dist/index.js"]:
+            self.assertTrue(mod.rebuildable(path), path)
+        for path in [".env", "infra/azure/terraform.tfvars", "generated/", "notes.md", "bin/", "obj/",
+                     ".claude/", "node_modules", "next-env.d.ts/", "build.log"]:
+            self.assertFalse(mod.rebuildable(path), path)
 
 
 if __name__ == "__main__":
