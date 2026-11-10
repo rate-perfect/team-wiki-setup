@@ -108,6 +108,8 @@ A worktree is REMOVE only when all of these are true:
    `git status`).
 5. Every ignored file in it is rebuildable (see below).
 6. No other worktree or git repo (any `.git` file or folder) is inside it.
+   To stay fast, it does not walk all of `node_modules`. It looks only for a
+   `.git` in `node_modules/<pkg>/` and `node_modules/@scope/<pkg>/`.
 7. No open PR uses the branch.
 8. No running process has its current folder inside the worktree. The script
    asks `lsof`.
@@ -120,7 +122,9 @@ The rebuildable list (the `REBUILDABLE` constant in the script) is:
 `.terraform/`, `coverage/`, `__pycache__/`, `.venv/`, `*.egg-info/`, `.mypy_cache/`,
 `.pytest_cache/`, `.ruff_cache/`, `htmlcov/`, `next-env.d.ts`,
 `expo-env.d.ts`, `*.tsbuildinfo` and `.coverage`. .NET `bin/` and `obj/` are
-not on it, because `bin/` often holds hand-written scripts.
+not on it, because `bin/` often holds hand-written scripts. A folder on the
+list counts only when it holds no tracked files. So an ignored `build/.env`
+in a tracked `build/` folder keeps the worktree.
 
 If it can't check something, it keeps the worktree and says why. For example:
 no GitHub remote (Azure DevOps repos), `gh` failed, or you are offline. If
@@ -137,8 +141,9 @@ ignored files, nested repos, and that HEAD and the branch still point at the
 checked commit. If anything changed, it skips that worktree. Then it runs
 `git worktree remove` (never `--force`), then
 `git update-ref -d refs/heads/<branch> <checked commit>`, which deletes the
-local branch only if it still points at that commit. Then it runs
-`git worktree prune`. It never touches remote branches.
+local branch only if it still points at that commit. It also removes the
+branch's settings (`git config --remove-section branch.<branch>`). Then it
+runs `git worktree prune`. It never touches remote branches.
 
 Good to know before you run `--apply`:
 

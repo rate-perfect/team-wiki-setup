@@ -169,6 +169,16 @@ class DryRunTest(unittest.TestCase):
         p["log"], sha = fx.worktree("log")
         fx.prs("log", merged(sha))
         write(os.path.join(p["log"], "notes.log"))
+        p["trackedbuild"], sha = fx.worktree("trackedbuild")
+        write(os.path.join(p["trackedbuild"], "build", "deploy.sh"), "echo hi\n")
+        fx.git(p["trackedbuild"], "add", "-f", "build/deploy.sh")
+        fx.git(p["trackedbuild"], "commit", "-q", "-m", "tracked build")
+        fx.prs("trackedbuild", merged(fx.git(p["trackedbuild"], "rev-parse", "HEAD")))
+        write(os.path.join(p["trackedbuild"], "build", ".env"), "TOKEN=x\n")
+        write(os.path.join(p["trackedbuild"], "build", "out", "app.js"))  # ignored, but build/ is tracked
+        p["untrackedbuild"], sha = fx.worktree("untrackedbuild")
+        fx.prs("untrackedbuild", merged(sha))
+        write(os.path.join(p["untrackedbuild"], "web", "build", ".env"), "TOKEN=x\n")  # whole build/ rebuilt
         # 1. nested worktrees and repos
         p["outer"], sha = fx.worktree("outer")
         fx.prs("outer", merged(sha))
@@ -184,6 +194,16 @@ class DryRunTest(unittest.TestCase):
         fx.git(fx.tmp, "init", "-q", "-b", "main", other)
         fx.git(other, "commit", "-q", "--allow-empty", "-m", "base")
         fx.git(other, "worktree", "add", "-q", os.path.join(p["nestfile"], "build", "otherwt"), "-b", "x")
+        p["nmrepo"], sha = fx.worktree("nmrepo")
+        fx.prs("nmrepo", merged(sha))
+        fx.git(fx.tmp, "init", "-q", os.path.join(p["nmrepo"], "node_modules", "mypkg"))
+        p["nmscoped"], sha = fx.worktree("nmscoped")
+        fx.prs("nmscoped", merged(sha))
+        fx.git(fx.tmp, "init", "-q", os.path.join(p["nmscoped"], "node_modules", "@acme", "pkg"))
+        p["nmplain"], sha = fx.worktree("nmplain")
+        fx.prs("nmplain", merged(sha))
+        write(os.path.join(p["nmplain"], "node_modules", "@acme", "pkg", "index.js"))
+        write(os.path.join(p["nmplain"], "node_modules", "left-pad", "index.js"))
         # 4. git settings that hide changes
         p["skipwt"], sha = fx.worktree("skipwt")
         fx.prs("skipwt", merged(sha))
@@ -275,9 +295,18 @@ class DryRunTest(unittest.TestCase):
         self.check("outside", "KEEP", "outside the scanned folders")
         self.check("base", "KEEP", "merged into release, not main")
 
+    def test_ignored_file_in_tracked_build_folder(self):
+        self.check("trackedbuild", "KEEP", "ignored files that would be deleted: build/.env, build/out/")
+        self.check("untrackedbuild", "REMOVE")  # web/build/ has no tracked files, so all of it is rebuilt
+
+    def test_repo_inside_node_modules(self):
+        self.check("nmrepo", "KEEP", "a git repo or worktree is inside it (node_modules/mypkg)")
+        self.check("nmscoped", "KEEP", "a git repo or worktree is inside it (node_modules/@acme/pkg)")
+        self.check("nmplain", "REMOVE")
+
     def test_each_repo_once_and_no_secret(self):
         self.assertEqual(self.proc.stdout.count("== "), 2, self.proc.stdout)  # widgets + adorepo, not notes
-        self.assertIn("Total: 2 repos, 3 REMOVE,", self.proc.stdout)
+        self.assertIn("Total: 2 repos, 5 REMOVE,", self.proc.stdout)
         self.assertNotIn("SECRET123", self.proc.stdout + self.proc.stderr)
 
     def test_dry_run_changes_nothing(self):
@@ -319,12 +348,18 @@ class ApplyTest(unittest.TestCase):
             done, sha = fx.worktree("done")
             fx.prs("done", merged(sha))
             fx.git(fx.main, "update-ref", "refs/remotes/origin/feat/done", sha)
+            fx.git(fx.main, "config", "branch.feat/done.remote", "origin")
+            fx.git(fx.main, "config", "branch.feat/done.merge", "refs/heads/feat/done")
+            plain, sha3 = fx.worktree("plain")  # no branch.feat/plain section: must not fail
+            fx.prs("plain", merged(sha3))
             dirty, sha2 = fx.worktree("dirty")
             fx.prs("dirty", merged(sha2))
             open(os.path.join(dirty, "new.txt"), "w").close()
             p = fx.run("--apply", fx.main)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-            self.assertIn("Removed 1, failed or skipped 0", p.stdout)
+            self.assertIn("Removed 2, failed or skipped 0", p.stdout)
+            self.assertNotIn("note: could not remove the config", p.stdout)
+            self.assertFalse(os.path.exists(plain))
             self.assertFalse(os.path.exists(done))
             self.assertEqual(fx.git(fx.main, "branch", "--list", "feat/done"), "")
             self.assertEqual(fx.git(fx.main, "rev-parse", "refs/remotes/origin/feat/done"), sha)  # remote ref kept
@@ -332,6 +367,22 @@ class ApplyTest(unittest.TestCase):
             self.assertTrue(fx.git(fx.main, "branch", "--list", "feat/dirty"))
             self.assertNotIn(os.path.realpath(done), fx.git(fx.main, "worktree", "list"))
             self.assertTrue(os.path.isfile(os.path.join(fx.main, "a.txt")))
+        finally:
+            fx.cleanup()
+
+    def test_apply_removes_branch_config(self):
+        fx = Fixture()
+        try:
+            done, sha = fx.worktree("done")
+            fx.prs("done", merged(sha))
+            fx.git(fx.main, "config", "branch.feat/done.remote", "origin")
+            fx.git(fx.main, "config", "branch.feat/done.merge", "refs/heads/feat/done")
+            fx.git(fx.main, "config", "branch.main.remote", "origin")
+            p = fx.run("--apply", fx.main)
+            self.assertIn("Removed 1, failed or skipped 0", p.stdout)
+            config = subprocess.run(["git", "-C", fx.main, "config", "--get-regexp", r"^branch\."],
+                                    env=fx.env, capture_output=True, text=True).stdout
+            self.assertEqual(config.strip(), "branch.main.remote origin")  # only the removed branch's section goes
         finally:
             fx.cleanup()
 
@@ -414,6 +465,11 @@ class RebuildableTest(unittest.TestCase):
                      "src/generated/api.ts", "pkg.egg-info/", "api/__pycache__/", ".venv/", ".coverage",
                      "dist/index.js", "coverage/", "web/coverage/lcov.info"]:
             self.assertTrue(mod.rebuildable(path), path)
+        # A folder pattern does not count when the folder (not just a parent) holds tracked files.
+        self.assertFalse(mod.rebuildable("build/.env", {"build"}))
+        self.assertFalse(mod.rebuildable("web/build/out/", {"web", "web/build"}))
+        self.assertTrue(mod.rebuildable("web/build/", {"web"}))
+        self.assertTrue(mod.rebuildable("build/x/node_modules/", {"build", "build/x"}))
         for path in [".env", "infra/azure/terraform.tfvars", "generated/", "notes.md", "bin/", "obj/",
                      ".claude/", "node_modules", "next-env.d.ts/", "build.log",
                      "prisma/dbml/", ".cache/", ".integration/", "coverage"]:

@@ -15,8 +15,10 @@ A worktree is REMOVE only when all of these hold:
   5. git status is empty (untracked files and submodules included), and no file is marked skip-worktree or
      assume-unchanged (those hide local edits from git status).
   6. Every ignored file in it is on the REBUILDABLE list below. Removing a worktree DELETES its ignored files,
-     so anything else (a .env, a terraform.tfvars, notes) means KEEP.
-  7. No other worktree or git repo (any .git file or folder) is inside it.
+     so anything else (a .env, a terraform.tfvars, notes) means KEEP. A folder on the list counts only when
+     it holds no tracked files, so an ignored build/.env in a tracked build/ folder means KEEP.
+  7. No other worktree or git repo (any .git file or folder) is inside it. In node_modules it looks only at
+     node_modules/<pkg>/ and node_modules/@scope/<pkg>/ (walking all of node_modules is too slow).
   8. No open PR uses the branch.
   9. No running process has its current folder inside the worktree (lsof). This only sees a process whose
      current folder is inside it. A session that works there by full path from elsewhere is not seen.
@@ -26,8 +28,9 @@ If the process check (lsof) cannot run, every worktree is KEEP unless you pass -
 --apply, for each REMOVE: first checks again (lsof, status, ignored files, nested repos, and that HEAD and the
 branch still point at the checked commit). Then git worktree remove <path> (never --force), then
 git update-ref -d refs/heads/<branch> <checked commit>, which deletes the local branch only if it still points
-at that commit. Then git worktree prune for each repo. Remote branches are never touched. Stashes are shared
-by all worktrees and are kept. The worktree's and branch's reflogs are gone after a remove.
+at that commit, and git config --remove-section branch.<branch>. Then git worktree prune for each repo.
+Remote branches are never touched. Stashes are shared by all worktrees and are kept. The worktree's and
+branch's reflogs are gone after a remove.
 
 Usage:
   worktree-cleanup [--apply] [--no-process-check] [--include-outside] [--parent DIR ...] [REPO ...]
@@ -56,8 +59,9 @@ ENV = dict(os.environ, LC_ALL="C", GIT_OPTIONAL_LOCKS="0", GH_PROMPT_DISABLED="1
 GITHUB_URL = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
 
 # Ignored files that are safe to delete, because a build or install makes them again. A pattern ending in /
-# is a folder at any depth (src/generated/ means a src folder holding a generated folder). Any other pattern
-# is a file name at any depth. An ignored file that matches none of these keeps the worktree.
+# is a folder at any depth (src/generated/ means a src folder holding a generated folder). It counts only when
+# that folder holds no tracked files: a tracked build/ can hold a hand-written ignored file, such as build/.env.
+# Any other pattern is a file name at any depth. An ignored file that matches none of these keeps the worktree.
 # .NET bin/ and obj/ are left out on purpose: bin/ often holds hand-written scripts, and the .NET repos are on
 # Azure DevOps, which this script can't check, so they are kept anyway.
 REBUILDABLE = [
@@ -65,7 +69,8 @@ REBUILDABLE = [
     "__pycache__/", ".venv/", "*.egg-info/", ".mypy_cache/", ".pytest_cache/", ".ruff_cache/", "htmlcov/",
     "next-env.d.ts", "expo-env.d.ts", "*.tsbuildinfo", ".coverage",
 ]
-WALK_SKIP = {"node_modules", ".git"}
+# The search for nested repos does not walk all of node_modules (too slow). It looks only for a .git directly
+# in node_modules/<pkg>/ and node_modules/@scope/<pkg>/, where a hand-made or linked package would be.
 
 
 def run(cmd, cwd=None, timeout=60):
@@ -189,8 +194,9 @@ def process_reasons(path, cwds):
     return []
 
 
-def rebuildable(path):
-    """True if an ignored path (from git ls-files, folders end in /) matches the REBUILDABLE list."""
+def rebuildable(path, tracked_dirs=frozenset()):
+    """True if an ignored path (from git ls-files, folders end in /) matches the REBUILDABLE list.
+    tracked_dirs: folders that hold tracked files (at any depth). A folder pattern there does not count."""
     is_dir = path.endswith("/")
     parts = path.rstrip("/").split("/")
     folders = parts if is_dir else parts[:-1]
@@ -198,7 +204,8 @@ def rebuildable(path):
         if pattern.endswith("/"):
             want = pattern.rstrip("/").split("/")
             for i in range(len(folders) - len(want) + 1):
-                if all(fnmatch.fnmatchcase(folders[i + j], w) for j, w in enumerate(want)):
+                if all(fnmatch.fnmatchcase(folders[i + j], w) for j, w in enumerate(want)) and \
+                        "/".join(folders[:i + len(want)]) not in tracked_dirs:
                     return True
         elif not is_dir and fnmatch.fnmatchcase(parts[-1], pattern):
             return True
@@ -217,21 +224,28 @@ def files_reasons(path):
         reasons.append(f"git status failed: {first_line(err)}")
     elif out.strip():
         reasons.append(f"uncommitted changes or untracked files ({len(out.splitlines())})")
+    tracked_dirs = None
     code, out, err = git(path, "ls-files", "-v", "-z")
     if code != 0:
         reasons.append(f"git ls-files -v failed: {first_line(err)}")
     else:
+        tracked_dirs = set()
+        for entry in out.split("\0"):
+            parts = entry[2:].split("/")[:-1]
+            tracked_dirs.update("/".join(parts[:n]) for n in range(1, len(parts) + 1))
         hidden = [e[2:] for e in out.split("\0") if e and (e[0] == "S" or e[0].islower())]
         if hidden:
             reasons.append(f"files marked skip-worktree or assume-unchanged: {show(hidden)}")
     code, out, err = git(path, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z")
-    if code != 0:
+    if tracked_dirs is None:
+        pass  # can't tell which folders are tracked; the ls-files -v reason above already keeps it
+    elif code != 0:
         reasons.append(f"could not list ignored files: {first_line(err)}")
     else:
         found = [p for p in out.split("\0") if p]
         # git can list a folder and also files inside it. Only the innermost entries count.
         leaves = [p for p in found if not (p.endswith("/") and any(o != p and o.startswith(p) for o in found))]
-        keep = [p for p in leaves if not rebuildable(p)]
+        keep = [p for p in leaves if not rebuildable(p, tracked_dirs)]
         if keep:
             reasons.append(f"ignored files that would be deleted: {show(keep)}")
     return reasons
@@ -248,8 +262,34 @@ def nested_reasons(path, all_paths, walk):
     for dirpath, dirnames, filenames in os.walk(real):
         if dirpath != real and (".git" in dirnames or ".git" in filenames):
             return [f"a git repo or worktree is inside it ({os.path.relpath(dirpath, real)})"]
-        dirnames[:] = [d for d in dirnames if d not in WALK_SKIP]
+        if "node_modules" in dirnames:
+            found = node_modules_repo(os.path.join(dirpath, "node_modules"))
+            if found:
+                return [f"a git repo or worktree is inside it ({os.path.relpath(found, real)})"]
+        dirnames[:] = [d for d in dirnames if d not in ("node_modules", ".git")]
     return []
+
+
+def node_modules_repo(folder):
+    """A package folder in node_modules/<pkg>/ or node_modules/@scope/<pkg>/ that holds a .git, or None."""
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    pkgs = []
+    for name in names:
+        sub = os.path.join(folder, name)
+        if name.startswith("@") and os.path.isdir(sub) and not os.path.islink(sub):
+            try:
+                pkgs += [os.path.join(sub, n) for n in sorted(os.listdir(sub))]
+            except OSError:
+                pass
+        else:
+            pkgs.append(sub)
+    for pkg in pkgs:
+        if not os.path.islink(pkg) and os.path.lexists(os.path.join(pkg, ".git")):
+            return pkg
+    return None
 
 
 # ---------- the GitHub checks ----------
@@ -446,6 +486,10 @@ def main(argv=None):
                     totals["failed"] += 1
                     print(f"   removed {wt['path']}, but kept branch {wt['branch']} (it moved?): {first_line(err)}")
                     continue
+                # update-ref leaves branch.<name>.* (upstream and so on) in the config. "No such section" is fine.
+                code, _, err = git(main_path, "config", "--remove-section", f"branch.{wt['branch']}")
+                if code != 0 and "no such section" not in err.lower():
+                    print(f"   note: could not remove the config for branch {wt['branch']}: {first_line(err)}")
                 totals["removed"] += 1
                 print(f"   removed {wt['path']} and local branch {wt['branch']}")
             code, _, err = git(main_path, "worktree", "prune")
