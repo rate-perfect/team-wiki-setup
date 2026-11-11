@@ -43,6 +43,10 @@ git -C <main checkout> worktree add ../team-wiki-setup-<short-name> origin/main 
 
 ## CI: Automated Review
 
+**It can't run here yet.** The shared review's workflow is in a private repo, and GitHub doesn't
+let a public repo call it, so every run fails before it starts. What follows is how it works once
+that is settled.
+
 Every PR gets an automated review from the shared Claude review, rate-perfect/claude-review.
 `.github/workflows/claude-code-review.yml` is a thin caller of its reusable workflow, pinned to a
 release commit (v1.1.1). The review arrives as one summary comment by `github-actions[bot]`, and

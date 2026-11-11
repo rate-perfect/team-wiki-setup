@@ -35,13 +35,13 @@ Do not flag variants of one issue: a pattern flagged in one file is not flagged 
 - It never loses the person's own settings. If `~/.claude/settings.json` is not valid JSON, or not a JSON object, it stops without writing. It keeps a `.bak` copy of `settings.json` and `CLAUDE.md` before it changes them. It merges into `env` and `hooks`; it never replaces the whole file.
 - In `~/.claude/CLAUDE.md` it changes only the lines between `<!-- BEGIN perfecti-team-wiki -->` and `<!-- END perfecti-team-wiki -->`. It stops when only one of the two lines is there. It writes through a symlink, not over it.
 - `claude-instructions.md` starts with the BEGIN line and ends with the END line, exactly as `install.sh` looks for them. Changing either line breaks every re-run.
-- The token is read with `read -s` or from `WIKI_PUBLISH_TOKEN`. It is never printed, logged or written anywhere but the `env` block of `settings.json`.
+- The token is read with `read -s` or from `WIKI_PUBLISH_TOKEN`. It is never printed, logged or written anywhere but the `env` block of `settings.json` (and the `settings.json.bak` copy the installer keeps of the previous file).
 - `install.sh` keeps `set -euo pipefail`. A new tool that the installer, a hook or a skill needs is checked at the top of `install.sh`, with an install hint, and listed in `README.md`'s prerequisites (today `node`, `jq` and `python3`). `worktree-cleanup` also needs `gh` and `lsof`; its own help and its `README.md` section say so.
 
 ### The hooks (`hooks/`)
 
 - They run on the person's machine before or after Claude's tool calls, so they fail open. Any error lets the call through. `repo-rules-first.py` logs the error to its `state/errors.log` and exits 0. It pauses a call only on purpose, with a `permissionDecision: "deny"` answer and a message that says what to do.
-- `repo-rules-first.py` holds no rules of its own: the repo's files stay the source of truth. It pauses one repo at most `MAX_DENIALS` times per session. Commands that only read are not paused. The main-checkout guard stays off unless the person's own `~/.claude/CLAUDE.md` has the `# Never change a main checkout` section.
+- `repo-rules-first.py` holds no rules of its own: the repo's files stay the source of truth. Its rules check pauses one repo at most `MAX_DENIALS` times per session. The optional main-checkout guard is the exception: once a person turns it on, it refuses every change in a main checkout, on purpose. Commands that only read are not paused. The main-checkout guard stays off unless the person's own `~/.claude/CLAUDE.md` has the `# Never change a main checkout` section.
 - Hooks stay fast: every `subprocess.run` has a timeout, as `git()` does today. The settings give them 10 to 15 seconds.
 - `remind-wiki-mirror.sh` only reminds. It never publishes, and it speaks only after an Artifact publish.
 - No `shell=True`, `eval` or unquoted expansion of a path, command or branch name taken from a tool call.
@@ -152,7 +152,7 @@ None
 ### Team Wiki Setup Checklist
 - Nothing secret or internal in the repo or this comment: PASS/FAIL/NOT CHECKED/N/A
 - Installer keeps people's own settings and is safe to re-run: PASS/FAIL/NOT CHECKED/N/A
-- Token never printed or written anywhere but settings.json: PASS/FAIL/NOT CHECKED/N/A
+- Token never printed or written anywhere but settings.json (and its .bak): PASS/FAIL/NOT CHECKED/N/A
 - Hooks fail open and stay fast: PASS/FAIL/NOT CHECKED/N/A
 - Cleanup keeps anything it can't prove safe: PASS/FAIL/NOT CHECKED/N/A
 - Tests for new cleanup behaviour: PASS/FAIL/NOT CHECKED/N/A
@@ -168,8 +168,8 @@ None
 
 - A secret, a token, a person's email address or another internal detail added to this public repo
 - An installer change that can lose or corrupt `settings.json`, or the person's own lines in `CLAUDE.md`
-- The token printed, logged, or written anywhere but the `env` block of `settings.json`
-- A hook that fails closed, pauses without limit, or can stop every tool call
+- The token printed, logged, or written anywhere but the `env` block of `settings.json` and its `.bak` copy
+- A hook in `hooks/` that fails closed, or a rules check that pauses without limit or can stop every tool call
 - A cleanup change that can remove a worktree with work in it, uses `--force`, or touches remote branches
 - A skill change that publishes `public` or shares a link without asking the person first
 - Security vulnerabilities, such as running a path or branch name from a tool call through a shell
