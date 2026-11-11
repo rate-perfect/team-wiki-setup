@@ -12,8 +12,8 @@ WIKI_PUBLISH_TOKEN=<token> ./install.sh
 ```
 
 Get the token from the Slack message (ask David). Prerequisites:
-`node`, `jq` (`brew install jq`) and `python3`. Restart Claude Code afterward. Re-run any
-time to update — it's idempotent.
+`node`, `jq` (`brew install jq`) and `python3`. Restart Claude Code afterward. To update,
+run `git pull --ff-only && ./install.sh` in your clone any time — it's idempotent.
 
 ## What it does
 
@@ -56,7 +56,8 @@ Optional settings for the repo rules hook:
   `~/projects/rate-perfect-workspace:~/projects:~/m3:~/m3/boss-modernization:~/m3/boss5`.
   To change it, set `REPO_RULES_CLONE_ROOTS` (colon-separated) in the `env`
   block of `~/.claude/settings.json`.
-- **Main checkout guard (off by default).** If you run several Claude sessions
+- **Main checkout guard (off by default).** (Not the same as this repo's own guard for
+  contributors, which is always on here; see `CLAUDE.md`.) If you run several Claude sessions
   on the same repo, you can make Claude work only in git worktrees. Add a
   section headed `# Never change a main checkout` to your own
   `~/.claude/CLAUDE.md`, outside the team block, saying what you allow. The
