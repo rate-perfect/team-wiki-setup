@@ -292,7 +292,9 @@ report the error:
     above). Otherwise point them to **Make visible to team**.
   - **Updating or hiding a page at that address:** don't pick a new slug. Read
     it with `?slug=`. If it is now a team page, republish it as `internal` to
-    update it, or point them to **Make private** to hide it. If it isn't found,
+    update it, or point them to **Make private** to hide it (only the page's
+    `owner` has that button; if it has no `owner`, tell the user it can't be
+    made private). If it isn't found,
     it's a private page: check with the user which email owns it.
 - **502 "Wrote the internal copy but could not remove the old one"**: the team
   page is live, but the private copy is still there. Send the same request
