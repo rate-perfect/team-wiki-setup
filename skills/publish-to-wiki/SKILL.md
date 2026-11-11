@@ -63,7 +63,11 @@ secrets, or anything the user marks private/local-only.
     everyone else. Use when the user wants it on their own wiki space, not
     shared with the team. **Requires `owner`.** They flip it to team-shared any
     time with the page's **Make visible to team** button (and back with **Make
-    private**), so private-first is a safe default when unsure.
+    private**), so private-first is a safe default when unsure. You can also
+    move it to the team for them: republish it with `visibility: internal`, the
+    same `slug`, and their email as `owner`. That moves the page (it keeps its
+    created date, parent and owner) and removes the private copy; the answer
+    says `moved: true`.
   - `public`: unlisted, link-only, for sharing *outside* the team. **Confirm
     with the user before publishing anything public.**
 - **share** *(optional, internal/private only)* — `true` also creates (or
@@ -73,7 +77,9 @@ secrets, or anything the user marks private/local-only.
   the page's latest version, so later edits need no re-share. Confirm before
   sharing, same as public. The owner can revoke it with the page's **Revoke**.
 - **owner** — the owner's email. **Required when `visibility` is `private`**
-  (that person becomes the sole viewer). Omit otherwise.
+  (that person becomes the sole viewer). For an `internal` publish, send it only
+  when you are moving the user's own private page to the team (see above).
+  Omit it otherwise.
 - **format** — `markdown` for written content, or `html` when the artifact is a
   complete `<!doctype html>` document (renders as-is in a sandboxed frame).
 - **Make it easy to consume.** Lead with the conclusion or plan, and put supporting detail below it. Markdown pages support tables and **collapsible sections** (`<details><summary>Title</summary>` … `</details>`, with a blank line after `</summary>` and before `</details>`), which suit long technical detail.
@@ -155,7 +161,8 @@ belongs, no offer to file it. Two things still
 happen on their behalf, quietly, because they keep other people's work intact:
 
 - a page that is already filed keeps its place when they republish it (leave
-  `parent` out, as always);
+  `parent` out, as always; if that gets a 400 because the kept parent is now a
+  private page, send `"parent": null` and tell them the page left Topics);
 - if they explicitly name a topic, they have just opted in: treat them as a
   Topics user from then on.
 
@@ -169,10 +176,13 @@ Then publish the real page with the section's slug as its `parent`.
 Only send `parent` again to move it, and only move a page when asked. To take a
 page out of Topics, send `"parent": null`.
 
-**Limits.** Public pages have no parent. A private page can sit under a team
-page, but the shared token cannot see private pages, so it can't find or read a
-private parent. A page can't be filed under itself or under one of its own
-sub-pages; the API returns 400.
+**Limits.** Public pages have no parent. A team page can only be filed under a
+team page. A private page can be filed under a team page or under the same
+owner's private page. The shared token cannot see private pages, so it can't
+find or read a private parent. A page can't be filed under itself or under one
+of its own sub-pages. Anything else gets a 400. If a republish gets a 400 because
+the parent it kept is a private page, send `"parent": null` to take it out of
+Topics, and tell the user.
 
 ## Keeping the parent page current
 A topic's parent page is often a summary of what sits under it: current status,
@@ -223,7 +233,8 @@ nothing.
 
 ## How to publish
 Write the body to a temp file to avoid shell-escaping issues, then POST it
-(`$OWNER` empty for non-private pages; `$SLUG` empty for a new page; `$PARENT`
+(`$OWNER` empty for team and public pages, except when moving the user's own
+private page to the team; `$SLUG` empty for a new page; `$PARENT`
 empty to leave the page's place in Topics as it is, or `-` to take it out):
 
 ```bash
@@ -258,6 +269,20 @@ Give the user the full URL: `https://wiki.perfecti.io` + that path. The response
 includes `parent` when the page is filed; say which topic it went under, and
 then do the parent check above. A `private`
 page's URL works only for its owner while signed in. If it returns `ok:false`,
-report the error (401 = token wrong/unset; 400 = missing field, e.g. `owner`
-required for a private page; 501/GitHub error = the server publish credential
-isn't configured — tell the user to check the wiki's Vercel env).
+nothing was published unless the error below says otherwise. Report the error:
+
+- **401**: the token is wrong or unset.
+- **400**: a missing or wrong field (for example `owner` is required for a
+  private page), or a `parent` that isn't allowed (see **Limits** above).
+- **409**: the address belongs to another page that this publish must not
+  replace or hide. If this is a team publish and the page at that address is
+  the user's own private page, send it again with their email as `owner` to
+  move it to the team. Otherwise send it again with a different `slug` (for
+  example add `-2`) and give the user the new URL.
+- **502 "Wrote the internal copy but could not remove the old one"**: the team
+  page is live, but the private copy is still there. Send the same request
+  again, with `owner`, to finish the move.
+- **501, or another GitHub error**: the server's publish credential isn't
+  configured. Tell the user to check the wiki's Vercel env.
+
+The fields and answers above follow the wiki's API contract (its OpenAPI spec).
