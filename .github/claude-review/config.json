@@ -1,0 +1,13 @@
+{
+  "$comment": "The shared review's config for team-wiki-setup (rate-perfect/claude-review v1.1.1; the keys are in its README, 'Config file'). Read from the PR's base branch, so a change takes effect once it is merged. pr-description is on because the rules let an author answer a finding in the PR description. Nothing is excluded: the repo has no generated or vendored files. README.md is protected because the rules check the code against what it promises.",
+  "checklist_heading": "### Team Wiki Setup Checklist",
+  "protected_patterns": [
+    "README.md"
+  ],
+  "contexts": {
+    "environment": {
+      "missing": "## About this repository in CI (team-wiki-setup)\nNOT AVAILABLE: the base branch has no .github/claude-review/environment.md. This repo is public, so the review comment is public: never quote a secret or an internal detail from the diff; name the file:line and say to remove it. Read CLAUDE.md and README.md for what this repo promises."
+    },
+    "pr-description": {}
+  }
+}

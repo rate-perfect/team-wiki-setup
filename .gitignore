@@ -1,1 +1,9 @@
 __pycache__/
+
+# Local Claude Code state (never committed; editable even in the main checkout)
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/worktrees/
+.claude/plans/
+.claude/*checkpoint*.json
+.claude/pipeline-metrics.json
