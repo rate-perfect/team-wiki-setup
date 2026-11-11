@@ -136,6 +136,8 @@ echo "✓ installed repo-rules-first hook (PreToolUse · Edit|Write|NotebookEdit
 # ~/.claude/bin is not on your PATH; call it by its full path. Needs python3,
 # gh and lsof.
 mkdir -p "$CLAUDE_DIR/bin"
+# One tool today; the loop is there for the next one.
+# shellcheck disable=SC2043
 for tool in worktree-cleanup; do
   cp "$SCRIPT_DIR/bin/$tool" "$CLAUDE_DIR/bin/$tool"
   chmod +x "$CLAUDE_DIR/bin/$tool"
