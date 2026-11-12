@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 
@@ -34,7 +35,9 @@ def write(path, text):
 class RepoRulesFirst(unittest.TestCase):
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="rrf-test-", dir=HERE))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.scratch = os.path.realpath(tempfile.mkdtemp(prefix="rrf-scratch-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
         self.home = os.path.join(self.tmp, "home")
         os.makedirs(os.path.join(self.home, ".claude"))
         # Repo A: where the session works.
@@ -54,10 +57,6 @@ class RepoRulesFirst(unittest.TestCase):
             git("-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-q", "-m", "init", cwd=repo)
         self.transcript = os.path.join(self.tmp, "transcript.jsonl")
         write(self.transcript, "")
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-        shutil.rmtree(self.scratch, ignore_errors=True)
 
     def mark_read(self, *files):
         with open(self.transcript, "a") as fh:
@@ -123,22 +122,70 @@ class RepoRulesFirst(unittest.TestCase):
         self.assertIn(".claude/skills/ship: Ship a release the way repo B does it", r)
         self.assertIsNone(self.run_hook("npx tsx ../repo-b/scripts/run.ts", session=session), "only once")
 
+    def test_wrapped_and_direct_runs(self):
+        self.mark_read(os.path.join(self.a, "CLAUDE.md"))
+        write(os.path.join(self.b, "scripts", "tool.sh"), "#!/bin/sh\necho hi\n")
+        os.chmod(os.path.join(self.b, "scripts", "tool.sh"), 0o755)
+        for cmd in ("npx -y tsx ../repo-b/scripts/run.ts", "npm exec -- tsx ../repo-b/scripts/run.ts",
+                    "env FOO=1 node ../repo-b/scripts/run.ts", "timeout 5 node ../repo-b/scripts/run.ts",
+                    "pnpm dlx tsx ../repo-b/scripts/run.ts", "../repo-b/scripts/tool.sh", "npm -C ../repo-b test",
+                    "make -C../repo-b"):
+            self.assert_paused_for(self.run_hook(cmd), self.b, cmd)
+
+    def test_a_scripts_own_input_isnt_code(self):
+        self.mark_read(os.path.join(self.a, "CLAUDE.md"))
+        for cmd in ("npx tsx a.ts ../repo-b/src/lib.ts", "node -e 'require(1)' ../repo-b/scripts/run.ts",
+                    "python3 -m json.tool ../repo-b/data.py"):
+            self.assertIsNone(self.run_hook(cmd), f"{cmd!r}: repo B's file is only input")
+
+    def test_nothing_from_outside_any_checkout(self):
+        for cmd in ("npx prettier --check x.ts", "npm token list", "node tool.js"):
+            self.assertIsNone(self.run_hook(cmd, cwd=self.scratch), cmd)
+        # npm commands that run nothing don't count, even inside a checkout whose rules aren't read.
+        for cmd in ("npm token list", "npm team ls", "npm view left-pad version"):
+            self.assertIsNone(self.run_hook(cmd, cwd=self.b), cmd)
+
+    def test_claude_code_folder_is_left_alone(self):
+        plugin = os.path.join(self.home, ".claude", "plugins", "marketplaces", "p")
+        write(os.path.join(plugin, "CLAUDE.md"), "# Plugin contributor rules\n")
+        write(os.path.join(plugin, "run.js"), "console.log(1);\n")
+        git("init", "-q", cwd=plugin)
+        self.assertIsNone(self.run_hook(f"node {plugin}/run.js", cwd=self.scratch))
+
+    def test_many_imports_and_long_files_stay_fast(self):
+        self.mark_read(os.path.join(self.a, "CLAUDE.md"))
+        files = []
+        for i in range(20):
+            f = os.path.join(self.a, "t", f"f{i}.test.ts")
+            write(f, "".join(f'import {{ m{j} }} from "../lib/m{j}";\n' for j in range(200)))
+            files.append(f)
+        blank = os.path.join(self.a, "blank.ts")
+        write(blank, "\n" * 900_000)
+        start = time.monotonic()
+        self.assertIsNone(self.run_hook("node --test " + " ".join(files)), "imports within repo A count only for A")
+        self.assertIsNone(self.run_hook(f"npx tsx {blank}"))
+        self.assertLess(time.monotonic() - start, 5, "well inside the hook's 15 s timeout")
+
     # --- the main checkout guard ---
 
     def test_main_checkout_guard_refuses_builds_there_but_not_running_its_code(self):
         write(os.path.join(self.home, ".claude", "CLAUDE.md"), "# Never change a main checkout\nWork in a worktree.\n")
         self.mark_read(os.path.join(self.a, "CLAUDE.md"), os.path.join(self.b, "CLAUDE.md"))
         session = uuid.uuid4().hex
-        # Run from a folder that isn't a checkout, so only repo B's main checkout can be the one refused.
-        outside = os.path.join(self.tmp, "home")
+        # Run from a scratch folder, which is no checkout, so repo B is the only one the hook can see.
+        outside = self.scratch
         r = self.run_hook(f"pnpm --dir {self.b} build", cwd=outside, session=session)
         self.assertIsNotNone(r)
         self.assertTrue(r.startswith("MAIN CHECKOUT"), "a build in a main checkout is refused, as before")
         self.assertIn(self.b, r, "in the folder --dir names, not the current one")
-        r = self.run_hook(f"npx tsx {self.b}/scripts/run.ts", cwd=outside, session=session)
-        self.assertTrue(r is None or not r.startswith("MAIN CHECKOUT"), "running its code only reads it")
-        r = self.run_hook(f"npm --prefix {self.b} test", cwd=outside, session=session)
-        self.assertTrue(r is None or not r.startswith("MAIN CHECKOUT"), "npm test isn't refused there, as before")
+        r = self.run_hook(f"npm --prefix {self.b} install", cwd=outside, session=session)
+        self.assertTrue(r and r.startswith("MAIN CHECKOUT"), "an install pointed at it is refused there too")
+        # Repo B's rules are read and its skills listed by the first pause below; after that nothing pauses.
+        self.run_hook(f"npx tsx {self.b}/scripts/run.ts", cwd=outside, session=session)
+        self.assertIsNone(self.run_hook(f"npx tsx {self.b}/scripts/run.ts", cwd=outside, session=session),
+                          "running its code only reads it")
+        self.assertIsNone(self.run_hook(f"npm --prefix {self.b} test", cwd=outside, session=session),
+                          "npm test isn't refused there, as before")
 
 
 if __name__ == "__main__":

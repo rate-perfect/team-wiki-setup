@@ -35,15 +35,25 @@ and files they import). This works even when the Claude session started in a
 different folder. If Claude hasn't read them, the hook pauses the change and
 shows the rules (or names the files to read). The hook holds no rules of its
 own, so each repo stays the source of truth. Commands that only read (such
-as `git status`, `cat` or `grep`) are not paused; builds, tests and package
-commands (`npm run`, `npm test`, `npx`, `pnpm`, `make`, `dotnet test`) count as
-changes. So does running a repo's code from anywhere: a build pointed at it
-(`npm --prefix <repo> test`, `pnpm --dir <repo> build`, `make -C <repo>`), or a
-script run with `node`, `tsx`, `python` and the like that lives in the repo or
-imports its code by path. So work started in one repo follows another repo's
-rules when it touches that repo. Text alone (a heredoc, a commit message)
-never counts. The hook also lists the repo's commands, agents and skills
-(`.claude/skills`), so their steps are followed rather than improvised. It needs
+as `git status`, `cat` or `grep`) are not paused. Builds, installs and package
+commands (`npm run`, `pnpm`, `make`, `dotnet test`) count as changes.
+
+Running a repo's code also counts, from any folder, so work started in one repo
+follows another repo's rules when it touches it:
+- a build or test pointed at it (`npm --prefix <repo> test`, `npm -C`,
+  `pnpm --dir <repo> build`, `yarn --cwd`, `make -C <repo>`), and `npm test`,
+  `npm start`, `npm exec` or `npx` run inside it;
+- a script run with `node`, `tsx`, `python`, `bash` and the like (also through
+  `npx`, `env`, `timeout` or `pnpm dlx`, or directly by its path) that lives in
+  the repo. A JavaScript or TypeScript script also counts for each repo it
+  imports code from by a relative or absolute path. Only the script's own
+  imports are followed, not theirs.
+
+The script's own arguments, text (a heredoc, a commit message) and Claude
+Code's own folder (`~/.claude`, where plugins are cloned) never count. The hook
+also lists the repo's commands, agents and skills (`.claude/skills`), so their
+steps are followed rather than improvised. Subagents keep their own record, so
+a subagent that runs a repo's tests is paused once for its rules too. It needs
 `python3`, lets everything through if it hits an error, and never pauses the
 same repo more than 4 times per session.
 
@@ -68,8 +78,11 @@ Optional settings for the repo rules hook:
   on the same repo, you can make Claude work only in git worktrees. Add a
   section headed `# Never change a main checkout` to your own
   `~/.claude/CLAUDE.md`, outside the team block, saying what you allow. The
-  hook then refuses edits, commits, branch switches and builds in a repo's
-  main checkout and quotes your section back. Delete the section to turn it
+  hook then refuses edits, commits, branch switches, installs and builds
+  (`npm install`/`ci`/`run`, `pnpm`, `yarn`, `make`, `dotnet`, also when a
+  `--prefix`, `--dir` or `-C` flag points at the checkout) in a repo's main
+  checkout and quotes your section back. Running its code (`npm test`, `npx`, a
+  script) only reads it, so that's allowed. Delete the section to turn it
   off.
 
 After that, whenever you ask Claude for a report, doc, dashboard, or HTML tool,
