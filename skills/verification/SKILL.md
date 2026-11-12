@@ -58,10 +58,10 @@ Pursue these actively — do not stop at the first source that is merely suggest
   branch you're reading, logs from an older deploy, a contract/generated-client version
   ahead of or behind the backend, or — when you read **another local repo** for evidence —
   a stale or wrong-branch checkout. For cross-repo reads, don't trust whatever is checked
-  out: the main branch is **`dev`** for essentially every repo, **except
-  `lender-match-web`, whose main branch is `staging`** — fetch and read the
-  remote-tracking ref (`origin/dev`, or `origin/staging`) rather than a possibly stale
-  working tree. In every case, note in your evidence chain the exact branch/commit/version
+  out, and don't assume which branch is the main one (it differs between repos: `dev`,
+  `staging`, `main`). Look it up (`git symbolic-ref refs/remotes/origin/HEAD`, or
+  `gh repo view --json defaultBranchRef`), then fetch and read that remote-tracking ref
+  (for example `origin/dev`) rather than a possibly stale working tree. In every case, note in your evidence chain the exact branch/commit/version
   you actually read.
 - **Read-only commands.** Run anything non-mutating that yields evidence — tests, type
   checks, builds, `grep`, log inspection, existing smoke scripts, CLI read calls.

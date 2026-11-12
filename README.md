@@ -86,8 +86,9 @@ Optional settings for the repo rules hook:
 - **Where your clones live.** The hook uses this only to find the repo named
   in a PR command run from outside it (`gh pr create --repo ...`,
   `az repos pr create ...`). The default is
-  `~/projects/rate-perfect-workspace:~/projects:~/m3:~/m3/boss-modernization:~/m3/boss5`.
-  To change it, set `REPO_RULES_CLONE_ROOTS` (colon-separated) in the `env`
+  `~/projects/rate-perfect-workspace:~/projects`. If your clones also live
+  elsewhere, set `REPO_RULES_CLONE_ROOTS` (colon-separated, for example
+  `~/projects/rate-perfect-workspace:~/projects:~/work/partner`) in the `env`
   block of `~/.claude/settings.json`.
 - **Main checkout guard (off by default).** (Not the same as this repo's own guard for
   contributors, which is always on here; see `CLAUDE.md`.) If you run several Claude sessions
@@ -126,7 +127,7 @@ yourself; it is not a hook.
 ```bash
 # Dry run: list every worktree with REMOVE or KEEP and the reasons. Changes nothing.
 ~/.claude/bin/worktree-cleanup --parent ~/projects/rate-perfect-workspace
-~/.claude/bin/worktree-cleanup ~/m3/deals-module-api ~/m3/deals-view
+~/.claude/bin/worktree-cleanup ~/work/billing-api ~/work/billing-web
 
 # Remove the REMOVE ones.
 ~/.claude/bin/worktree-cleanup --apply --parent ~/projects/rate-perfect-workspace
@@ -138,7 +139,7 @@ yourself; it is not a hook.
   are matched back to their repo, so each repo shows once.
 - Only worktrees inside a `--parent` folder, or inside the folder that holds a
   `REPO`, can be removed. A repo can also have worktrees somewhere else (for
-  example in `/tmp`, or a repo in `~/m3` with a worktree in your workspace).
+  example in `/tmp`, or a repo in `~/work` with a worktree in your workspace).
   Those are KEEP, "outside the scanned folders". Pass `--include-outside` to
   allow them.
 

@@ -140,7 +140,7 @@ check the last point is fine: it is one quick read and the user never sees it.
 
 **For a Topics user, lean towards filing.**
 
-1. **They name a topic** ("put it under DocIQ", "file this with the
+1. **They name a topic** ("put it under Onboarding", "file this with the
    PP-StructureV3 pages"). Find the page they mean in the tree or by search and
    pass its slug as `parent`. If nothing matches, say so and ask whether to
    create a new section or publish unfiled; don't guess at a near miss.
