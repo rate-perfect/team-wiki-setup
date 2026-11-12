@@ -1,4 +1,6 @@
 __pycache__/
+# Throwaway repos made by tests/test_repo_rules_first.py (removed after each test)
+tests/rrf-test-*/
 
 # Local Claude Code state (never committed; editable even in the main checkout)
 CLAUDE.local.md
