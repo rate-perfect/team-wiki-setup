@@ -313,7 +313,7 @@ GIT_MUTATING = {"commit", "push", "merge", "cherry-pick", "rebase", "reset", "re
 FILE_WRITERS = {"rm", "touch", "mkdir", "tee", "truncate", "patch", "rmdir", "chmod"}
 LAST_ARG_WRITERS = {"cp", "mv", "ln", "rsync", "install"}
 PKG_TOOLS = re.compile(r"^(?:dotnet\s+(?:add|remove|new|format|build|restore|test|publish|run)|npm\s+(?:install|i|ci|"
-                       r"uninstall|version|run)(?=\s|$)|pnpm\s+\S+|yarn\s*\S*|poetry\s+\S+|make\b)")
+                       r"uninstall|version|run|run-script|install-test|it|install-ci-test|cit)(?=\s|$)|pnpm\s+\S+|yarn\s*\S*|poetry\s+\S+|make\b)")
 # More commands that run a checkout's code. For the rules check only: the main checkout guard keeps PKG_TOOLS.
 RUN_TOOLS = re.compile(r"^(?:npm\s+(?:run-script|test|t|start|exec|x)(?=\s|$)|npx\s+\S+)")
 # Flags that point a package tool at another folder: `npm --prefix <dir> test`, `pnpm --dir <dir> build`, ...
@@ -386,8 +386,8 @@ def segment_targets(tokens, here):
             skip = tok != "<<HEREDOC"
             continue
         words.append(tok)
-    while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
-        words = words[1:]
+    # Past env assignments and wrappers such as `timeout 600` or `time`, so `timeout 600 npm run test` is a build.
+    words = strip_wrappers(words, NON_PKG_WRAPPERS)
     if not words:
         return targets
     cmd, args = words[0], words[1:]
@@ -459,11 +459,12 @@ WRAPPERS = {"env": {"-u", "--unset", "-C", "--chdir", "-S"}, "time": set(), "nic
 TWO_WORD_WRAPPERS = {("npm", "exec"), ("npm", "x"), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "exec")}
 # Package-tool wrappers are stripped only after npm's own run commands are matched (`npx` is one).
 PKG_WRAPPERS = {"npx", "bunx"}
-SHELL_KEYWORDS = {"do", "then", "else", "elif", "!", "{", "time"}
+NON_PKG_WRAPPERS = {w for w in WRAPPERS if w not in PKG_WRAPPERS}
+SHELL_KEYWORDS = {"if", "while", "until", "do", "then", "else", "elif", "!", "{", "time"}
 # Per runner: flags after which the code comes from the command line or a module name (`node -e`, `python -c`,
 # `python -m`), not a script file; and flags whose value is not the script (`node --import ./reg.mjs`).
 INLINE_CODE_FLAGS = {"node": {"-e", "--eval", "-p", "--print"}, "bun": {"-e", "--eval", "-p", "--print"},
-                     "deno": {"eval"}, "python": {"-c", "-m"}, "bash": {"-c"}, "ruby": {"-e"}, "perl": {"-e", "-E"}}
+                     "deno": {"eval"}, "python": {"-c", "-m"}, "bash": {"-c", "-s"}, "ruby": {"-e"}, "perl": {"-e", "-E"}}
 VALUE_FLAGS = {"node": {"--import", "-r", "--require", "--loader", "--experimental-loader", "--env-file", "-C",
                         "--conditions", "--test-reporter", "--test-reporter-destination", "--test-name-pattern"},
                "python": {"-X", "-W", "-Q"}, "bash": {"-o", "-O", "+o", "+O"}, "ruby": {"-r", "-I"},
@@ -475,6 +476,7 @@ JS_EXT = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".tsx", ".jsx")
 # lines quadratic.
 IMPORT_SPEC = re.compile(r"""(?:\bfrom\s+|\bimport\s*\(\s*|\brequire\s*\(\s*|^[ \t]*import\s+)(['"])([./][^'"]*)\1""", re.M)
 MAX_SCRIPT_BYTES = 1_000_000
+DEPENDENCY_DIR = re.compile(r"/(?:node_modules|\.venv|venv|site-packages|\.tox)/")
 # Per command, so one command can't make the hook slow: imports followed out of a script's own checkout, and scripts.
 MAX_IMPORTS_PER_COMMAND = 300
 MAX_SCRIPTS_PER_COMMAND = 200
@@ -491,6 +493,8 @@ def strip_wrappers(words, wrappers):
             words = words[1:]
         elif tuple(words[:2]) in TWO_WORD_WRAPPERS and "npm-exec" in wrappers:
             words = words[2:]
+            while words and words[0].startswith("-") and words[0] != "--":
+                words = words[1:]
         elif name in wrappers:
             if name == "command" and len(words) > 1 and words[1] in ("-v", "-V"):
                 return []  # `command -v x` only looks x up
@@ -515,12 +519,14 @@ def script_args(runner, args):
         if skip:
             skip = False
             continue
-        if a in inline or (family == "perl" and re.match(r"^-\w*[eE]\w*$", a)):
-            break
+        if a == "-" or a in inline or (family == "perl" and re.match(r"^-\w*[eE]\w*$", a)):
+            break  # the code comes from stdin, the command line or a module name
+        if any(len(f) == 2 and a.startswith(f) and len(a) > 2 for f in inline):
+            break  # the same, with the value attached (`python -mjson.tool`, `python -cprint(1)`)
         if a in values:
             skip = True
             continue
-        if a == "--test" and not files:
+        if a == "--test":  # only reachable before the first file: the scan stops after it unless --test came first
             many = True
             continue
         if a.startswith("-") or a.startswith("+"):
@@ -554,7 +560,7 @@ def run_targets(tokens, here, budget):
             skip = True
         else:
             words.append(tok)
-    words = strip_wrappers(words, {w for w in WRAPPERS if w not in PKG_WRAPPERS})
+    words = strip_wrappers(words, NON_PKG_WRAPPERS)
     paths = []
     if words and RUN_TOOLS.match(" ".join([words[0]] + without_dir_flags(words[0], words[1:]))):
         paths.append(pkg_dir(words[0], words[1:], here))
@@ -572,6 +578,12 @@ def run_targets(tokens, here, budget):
         if budget[1] <= 0:
             break
         budget[1] -= 1
+        if DEPENDENCY_DIR.search(resolve(a, here)):
+            # An installed tool (./node_modules/.bin/vitest, .venv/bin/pytest) runs on behalf of the folder the
+            # command runs in, as npx does. Its real path is no guide: a worktree may link node_modules from the
+            # main checkout.
+            paths.append(here)
+            continue
         f = os.path.realpath(resolve(a, here))
         if not os.path.isfile(f):
             continue
