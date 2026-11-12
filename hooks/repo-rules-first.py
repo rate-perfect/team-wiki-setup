@@ -43,7 +43,7 @@ MAX_DENIALS = 4
 RULE_FILES = ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md", "docs/team-knowledge.md"]
 LISTED_DIRS = [".claude/commands", ".claude/agents", "docs/claude", ".claude/rules"]
 # Where local clones live, used only to find a repo named in a PR command (az/gh/curl) run outside it.
-DEFAULT_CLONE_ROOTS = "~/projects/rate-perfect-workspace:~/projects"
+DEFAULT_CLONE_ROOTS = "~/projects"
 CLONE_ROOTS = [r for r in (os.environ.get("REPO_RULES_CLONE_ROOTS") or DEFAULT_CLONE_ROOTS).split(":") if r]
 STATE_MAX_AGE_DAYS = 14       # per-session state older than this is deleted when a session is compacted
 SKIP_DIRS = {"node_modules", "bin", "obj", ".git", "dist", "build", ".venv", "venv", "Generated", "generated"}

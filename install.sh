@@ -5,7 +5,7 @@
 #   WIKI_PUBLISH_TOKEN=<token> ./install.sh
 #
 # (or just ./install.sh and it will prompt for the token). Get the token from
-# David (posted in Slack). Re-run any time to update to the latest
+# the wiki's admin (posted in Slack). Re-run any time to update to the latest
 # instruction + skills (safe/idempotent).
 set -euo pipefail
 

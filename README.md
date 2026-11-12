@@ -11,7 +11,7 @@ cd team-wiki-setup
 WIKI_PUBLISH_TOKEN=<token> ./install.sh
 ```
 
-Get the token from the Slack message (ask David). Prerequisites:
+Get the token from the Slack message (ask the wiki's admin). Prerequisites:
 `node`, `jq` (`brew install jq`) and `python3`. Restart Claude Code afterward. To update,
 run `git pull --ff-only && ./install.sh` in your clone any time — it's idempotent.
 
@@ -85,11 +85,12 @@ Optional settings for the repo rules hook:
 
 - **Where your clones live.** The hook uses this only to find the repo named
   in a PR command run from outside it (`gh pr create --repo ...`,
-  `az repos pr create ...`). The default is
-  `~/projects/rate-perfect-workspace:~/projects`. If your clones also live
+  `az repos pr create ...`). The default is `~/projects`. If your clones live
   elsewhere, set `REPO_RULES_CLONE_ROOTS` (colon-separated, for example
-  `~/projects/rate-perfect-workspace:~/projects:~/work/partner`) in the `env`
-  block of `~/.claude/settings.json`.
+  `~/projects:~/projects/workspace:~/work/partner`) in the `env` block of
+  `~/.claude/settings.json`. It replaces the default, so list `~/projects` too
+  if you use it. A repo the hook can't find this way isn't checked for those PR
+  commands (the hook lets the call through).
 - **Main checkout guard (off by default).** (Not the same as this repo's own guard for
   contributors, which is always on here; see `CLAUDE.md`.) If you run several Claude sessions
   on the same repo, you can make Claude work only in git worktrees. Add a
@@ -126,11 +127,11 @@ yourself; it is not a hook.
 
 ```bash
 # Dry run: list every worktree with REMOVE or KEEP and the reasons. Changes nothing.
-~/.claude/bin/worktree-cleanup --parent ~/projects/rate-perfect-workspace
+~/.claude/bin/worktree-cleanup --parent ~/projects/workspace
 ~/.claude/bin/worktree-cleanup ~/work/billing-api ~/work/billing-web
 
 # Remove the REMOVE ones.
-~/.claude/bin/worktree-cleanup --apply --parent ~/projects/rate-perfect-workspace
+~/.claude/bin/worktree-cleanup --apply --parent ~/projects/workspace
 ```
 
 - `REPO` is a git repo, or any of its worktrees. Give as many as you like.
