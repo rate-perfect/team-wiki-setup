@@ -129,21 +129,74 @@ class RepoRulesFirst(unittest.TestCase):
         for cmd in ("npx -y tsx ../repo-b/scripts/run.ts", "npm exec -- tsx ../repo-b/scripts/run.ts",
                     "env FOO=1 node ../repo-b/scripts/run.ts", "timeout 5 node ../repo-b/scripts/run.ts",
                     "pnpm dlx tsx ../repo-b/scripts/run.ts", "../repo-b/scripts/tool.sh", "npm -C ../repo-b test",
-                    "make -C../repo-b"):
+                    "make -C../repo-b", "nice -n 10 node ../repo-b/scripts/run.ts",
+                    "env -u HOME node ../repo-b/scripts/run.ts", "timeout -k 5 10 node ../repo-b/scripts/run.ts",
+                    "/usr/bin/env node ../repo-b/scripts/run.ts", "for f in 1; do node ../repo-b/scripts/run.ts; done",
+                    "bash -e ../repo-b/scripts/tool.sh", "node --import ./a.ts ../repo-b/scripts/run.ts",
+                    "env CI=1 npm --prefix ../repo-b test", "cd ../repo-b && time npm test",
+                    "cd ../repo-b && timeout 600 npm test"):
             self.assert_paused_for(self.run_hook(cmd), self.b, cmd)
 
     def test_a_scripts_own_input_isnt_code(self):
         self.mark_read(os.path.join(self.a, "CLAUDE.md"))
+        write(os.path.join(self.b, "data.py"), "x = 1\n")
+        write(os.path.join(self.b, "scripts", "lookup.sh"), "#!/bin/sh\necho hi\n")
         for cmd in ("npx tsx a.ts ../repo-b/src/lib.ts", "node -e 'require(1)' ../repo-b/scripts/run.ts",
-                    "python3 -m json.tool ../repo-b/data.py"):
+                    "python3 -m json.tool ../repo-b/data.py", "command -v ../repo-b/scripts/lookup.sh"):
             self.assertIsNone(self.run_hook(cmd), f"{cmd!r}: repo B's file is only input")
 
     def test_nothing_from_outside_any_checkout(self):
         for cmd in ("npx prettier --check x.ts", "npm token list", "node tool.js"):
             self.assertIsNone(self.run_hook(cmd, cwd=self.scratch), cmd)
         # npm commands that run nothing don't count, even inside a checkout whose rules aren't read.
-        for cmd in ("npm token list", "npm team ls", "npm view left-pad version"):
+        for cmd in ("npm token list", "npm team ls", "npm view left-pad version", "npm info left-pad", "npm init --help"):
             self.assertIsNone(self.run_hook(cmd, cwd=self.b), cmd)
+
+    def test_a_runner_given_by_path_is_not_the_code_run(self):
+        # Like Homebrew: a toolchain that is itself a checkout with rules, whose node and python are run by path.
+        tools = os.path.join(self.tmp, "toolchain")
+        write(os.path.join(tools, "CLAUDE.md"), "# Toolchain contributor rules\n")
+        for name in ("node", "python3"):
+            write(os.path.join(tools, "bin", name), "#!/bin/sh\n")
+            os.chmod(os.path.join(tools, "bin", name), 0o755)
+        git("init", "-q", cwd=tools)
+        self.assertIsNone(self.run_hook(f"{tools}/bin/python3 -V", cwd=self.scratch))
+        r = self.run_hook(f"{tools}/bin/node {self.b}/scripts/run.ts", cwd=self.scratch)
+        self.assert_paused_for(r, self.b, "the script, not the runner")
+        self.assertNotIn("Toolchain", r)
+
+    def test_tool_checkouts_are_known(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("rrf", HOOK)
+        rrf = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rrf)
+        homebrew = os.path.realpath("/opt/homebrew")
+        self.assertTrue(rrf.is_tool_checkout(homebrew) and rrf.is_tool_checkout(homebrew + "/Library/Taps/x"))
+        self.assertFalse(rrf.is_tool_checkout(self.b))
+
+    def test_imports_follow_the_real_path_and_stop_at_the_cap(self):
+        # A script in repo B, reached through a symlink, imports repo A by a path that only works from its real folder.
+        write(os.path.join(self.b, "scripts", "uses-a.ts"), 'import { y } from "../../repo-a/a";\n')
+        os.makedirs(os.path.join(self.scratch, "x"))
+        os.symlink(os.path.join(self.b, "scripts"), os.path.join(self.scratch, "x", "link"))
+        self.mark_read(os.path.join(self.b, "CLAUDE.md"))
+        session = uuid.uuid4().hex
+        cmd = f"node {self.scratch}/x/link/uses-a.ts"
+        self.run_hook(cmd, cwd=self.scratch, session=session)  # lists repo B's skills once
+        self.assert_paused_for(self.run_hook(cmd, cwd=self.scratch, session=session), self.a, "the real path")
+        # Past the cap, imports aren't followed: 300 into repo A (read), then one into repo B (not read).
+        cap = os.path.join(self.scratch, "cap.ts")
+        lines = [f'import {{ m{i} }} from "{self.a}/d{i}/m";' for i in range(300)]
+        for i in range(300):
+            os.makedirs(os.path.join(self.a, f"d{i}"))
+        lines.append(f'import {{ z }} from "{self.b}/src/lib";')
+        write(cap, "\n".join(lines) + "\n")
+        fresh = os.path.join(self.tmp, "fresh-transcript.jsonl")
+        write(fresh, json.dumps({"text": f"Contents of {self.a}/CLAUDE.md"}) + "\n")
+        self.transcript = fresh
+        start = time.monotonic()
+        self.assertIsNone(self.run_hook(f"node {cap}", cwd=self.scratch), "the 301st import isn't followed")
+        self.assertLess(time.monotonic() - start, 5)
 
     def test_claude_code_folder_is_left_alone(self):
         plugin = os.path.join(self.home, ".claude", "plugins", "marketplaces", "p")

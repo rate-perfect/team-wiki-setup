@@ -35,8 +35,9 @@ and files they import). This works even when the Claude session started in a
 different folder. If Claude hasn't read them, the hook pauses the change and
 shows the rules (or names the files to read). The hook holds no rules of its
 own, so each repo stays the source of truth. Commands that only read (such
-as `git status`, `cat` or `grep`) are not paused. Builds, installs and package
-commands (`npm run`, `pnpm`, `make`, `dotnet test`) count as changes.
+as `git status`, `cat`, `grep` or `npm view`) are not paused. Builds, installs
+and package commands (`npm install`/`ci`/`run`, any `pnpm` or `yarn` command,
+`make`, `dotnet test`) count as changes.
 
 Running a repo's code also counts, from any folder, so work started in one repo
 follows another repo's rules when it touches it:
@@ -44,16 +45,20 @@ follows another repo's rules when it touches it:
   `pnpm --dir <repo> build`, `yarn --cwd`, `make -C <repo>`), and `npm test`,
   `npm start`, `npm exec` or `npx` run inside it;
 - a script run with `node`, `tsx`, `python`, `bash` and the like (also through
-  `npx`, `env`, `timeout` or `pnpm dlx`, or directly by its path) that lives in
-  the repo. A JavaScript or TypeScript script also counts for each repo it
-  imports code from by a relative or absolute path. Only the script's own
-  imports are followed, not theirs.
+  `npx`, `npm exec`, `pnpm dlx`, `env`, `nice` or `timeout`, inside a `for` or
+  `if`, or a `#!` script run directly by its path) that lives in the repo. Only
+  the script counts, not the files it is given to work on; with `node --test`,
+  every test file counts. A JavaScript or TypeScript script also counts for each
+  repo it imports code from by a relative or absolute path (only the script's
+  own imports, up to 300 per command).
 
-The script's own arguments, text (a heredoc, a commit message) and Claude
-Code's own folder (`~/.claude`, where plugins are cloned) never count. The hook
-also lists the repo's commands, agents and skills (`.claude/skills`), so their
-steps are followed rather than improvised. Subagents keep their own record, so
-a subagent that runs a repo's tests is paused once for its rules too. It needs
+Text (a heredoc, a commit message) never counts. Neither do tool folders that
+happen to be git checkouts: Claude Code's own `~/.claude` (where plugins are
+cloned) and Homebrew's prefix, so `/opt/homebrew/bin/node` or a virtualenv's
+`python` run by path is just the runner. The hook also lists the repo's
+commands, agents and skills (`.claude/skills`), so their steps are followed
+rather than improvised. Subagents keep their own record, so a subagent that
+runs a repo's tests is paused once for its rules too. It needs
 `python3`, lets everything through if it hits an error, and never pauses the
 same repo more than 4 times per session.
 
@@ -78,11 +83,12 @@ Optional settings for the repo rules hook:
   on the same repo, you can make Claude work only in git worktrees. Add a
   section headed `# Never change a main checkout` to your own
   `~/.claude/CLAUDE.md`, outside the team block, saying what you allow. The
-  hook then refuses edits, commits, branch switches, installs and builds
-  (`npm install`/`ci`/`run`, `pnpm`, `yarn`, `make`, `dotnet`, also when a
-  `--prefix`, `--dir` or `-C` flag points at the checkout) in a repo's main
-  checkout and quotes your section back. Running its code (`npm test`, `npx`, a
-  script) only reads it, so that's allowed. Delete the section to turn it
+  hook then refuses edits, commits, branch switches, installs and builds in a
+  repo's main checkout (`npm install`/`ci`/`run`, any `pnpm` or `yarn` command,
+  `make`, `dotnet`; also when `--prefix`, `-C`, `--dir`, `--cwd` or
+  `--directory` points at it) and quotes your section back. Running its code
+  with `npm test`, `npm start`, `npx` or a script only reads it, so that's
+  allowed. Delete the section to turn it
   off.
 
 After that, whenever you ask Claude for a report, doc, dashboard, or HTML tool,

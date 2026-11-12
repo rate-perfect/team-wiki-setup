@@ -152,15 +152,14 @@ def candidate_paths(tool, ti, cwd):
                 paths.append(clone)
     # The folders each simple command would write to (same reading as the main checkout guard).
     here = cwd
-    budget = [MAX_IMPORTS_PER_COMMAND]
+    budget = [MAX_IMPORTS_PER_COMMAND, MAX_SCRIPTS_PER_COMMAND]
     for tokens in shell_segments(cmd):
         if tokens and tokens[0] == "cd":
             if len(tokens) > 1 and "$" not in tokens[1]:
                 here = resolve(tokens[1], here)
             continue
         found = segment_targets(tokens, here) + run_targets(tokens, here, budget)
-        paths += [t for t in found if "$" not in t and not t.startswith(SCRATCH_PREFIXES)
-                  and not t.startswith(CLAUDE_HOME + os.sep)]
+        paths += [t for t in found if "$" not in t and not t.startswith(SCRATCH_PREFIXES)]
     return list(dict.fromkeys(paths))
 
 
@@ -301,14 +300,20 @@ TAIL = ("Follow them. Where they conflict with the user's instructions or memory
 GLOBAL_RULES = os.path.expanduser("~/.claude/CLAUDE.md")
 MAIN_RULE_HEADING = "# Never change a main checkout"
 SCRATCH_PREFIXES = ("/private/tmp/", "/tmp/", "/private/var/", "/var/folders/")
-# Claude Code's own folder: plugin marketplaces are git clones with contributor rules of their own, not work repos.
-CLAUDE_HOME = os.path.expanduser("~/.claude")
+# Checkouts that hold tools, not work: Claude Code's own folder (plugin marketplaces are git clones with contributor
+# rules of their own) and Homebrew, whose prefix is a git checkout that every brew-installed binary resolves into.
+TOOL_CHECKOUTS = tuple(os.path.realpath(os.path.expanduser(p)) for p in
+                       ("~/.claude", "/opt/homebrew", "/usr/local/Homebrew", "/home/linuxbrew/.linuxbrew"))
+
+
+def is_tool_checkout(top):
+    return any(top == t or top.startswith(t + os.sep) for t in TOOL_CHECKOUTS)
 GIT_MUTATING = {"commit", "push", "merge", "cherry-pick", "rebase", "reset", "revert", "am", "apply", "checkout",
                 "switch", "restore", "rm", "mv", "add", "stash", "tag", "pull", "clean"}
 FILE_WRITERS = {"rm", "touch", "mkdir", "tee", "truncate", "patch", "rmdir", "chmod"}
 LAST_ARG_WRITERS = {"cp", "mv", "ln", "rsync", "install"}
 PKG_TOOLS = re.compile(r"^(?:dotnet\s+(?:add|remove|new|format|build|restore|test|publish|run)|npm\s+(?:install|i|ci|"
-                       r"uninstall|version|run)|pnpm\s+\S+|yarn\s*\S*|poetry\s+\S+|make\b)")
+                       r"uninstall|version|run)(?=\s|$)|pnpm\s+\S+|yarn\s*\S*|poetry\s+\S+|make\b)")
 # More commands that run a checkout's code. For the rules check only: the main checkout guard keeps PKG_TOOLS.
 RUN_TOOLS = re.compile(r"^(?:npm\s+(?:run-script|test|t|start|exec|x)(?=\s|$)|npx\s+\S+)")
 # Flags that point a package tool at another folder: `npm --prefix <dir> test`, `pnpm --dir <dir> build`, ...
@@ -447,64 +452,100 @@ def attached_value(arg, flag):
 # This is for the rules check only; the main checkout guard ignores it (running code reads a checkout, it doesn't
 # change it).
 RUNNERS = {"node", "tsx", "ts-node", "bun", "deno", "python", "python3", "bash", "sh", "zsh", "ruby", "perl"}
-# Words that run the next word as the command. Their own flags (`npx -y`, `env -i`) and `timeout`'s duration are
-# skipped too. Two-word ones: `npm exec`, `pnpm exec`, `pnpm dlx`, `yarn exec`.
-WRAPPERS = {"npx", "bunx", "env", "time", "nice", "exec", "timeout", "command"}
+# Words that run the rest of the line as a command, and which of their flags take a value (`nice -n 10`).
+WRAPPERS = {"env": {"-u", "--unset", "-C", "--chdir", "-S"}, "time": set(), "nice": {"-n"}, "exec": {"-a"},
+            "timeout": {"-k", "--kill-after", "-s", "--signal"}, "command": set(), "npx": {"-p", "--package"},
+            "bunx": {"-p", "--package"}}
 TWO_WORD_WRAPPERS = {("npm", "exec"), ("npm", "x"), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "exec")}
-# After these runner flags the code comes from the command line (`node -e`, `python -c`) or a module name
-# (`python -m`), not a script file.
-INLINE_CODE_FLAGS = {"-e", "--eval", "-p", "--print", "-c", "-m"}
+# Package-tool wrappers are stripped only after npm's own run commands are matched (`npx` is one).
+PKG_WRAPPERS = {"npx", "bunx"}
+SHELL_KEYWORDS = {"do", "then", "else", "elif", "!", "{", "time"}
+# Per runner: flags after which the code comes from the command line or a module name (`node -e`, `python -c`,
+# `python -m`), not a script file; and flags whose value is not the script (`node --import ./reg.mjs`).
+INLINE_CODE_FLAGS = {"node": {"-e", "--eval", "-p", "--print"}, "bun": {"-e", "--eval", "-p", "--print"},
+                     "deno": {"eval"}, "python": {"-c", "-m"}, "bash": {"-c"}, "ruby": {"-e"}, "perl": {"-e", "-E"}}
+VALUE_FLAGS = {"node": {"--import", "-r", "--require", "--loader", "--experimental-loader", "--env-file", "-C",
+                        "--conditions", "--test-reporter", "--test-reporter-destination", "--test-name-pattern"},
+               "python": {"-X", "-W", "-Q"}, "bash": {"-o", "-O", "+o", "+O"}, "ruby": {"-r", "-I"},
+               "perl": {"-M", "-I"}}
+RUNNER_FAMILY = {"python3": "python", "sh": "bash", "zsh": "bash", "tsx": "node", "ts-node": "node"}
 SCRIPT_EXT = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".tsx", ".jsx", ".py", ".sh", ".rb", ".pl")
 JS_EXT = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".tsx", ".jsx")
 # `[ \t]*`, not `\s*`, before a line-start import: with re.M, `\s*` would also eat newlines and make a run of blank
 # lines quadratic.
 IMPORT_SPEC = re.compile(r"""(?:\bfrom\s+|\bimport\s*\(\s*|\brequire\s*\(\s*|^[ \t]*import\s+)(['"])([./][^'"]*)\1""", re.M)
 MAX_SCRIPT_BYTES = 1_000_000
-# Imports followed per command, across all its scripts, so one command can't make the hook slow.
+# Per command, so one command can't make the hook slow: imports followed out of a script's own checkout, and scripts.
 MAX_IMPORTS_PER_COMMAND = 300
+MAX_SCRIPTS_PER_COMMAND = 200
 
 
-def strip_wrappers(words):
-    """The words from the command actually run: past env assignments, wrappers, their flags and `--`."""
+def strip_wrappers(words, wrappers):
+    """The words from the command actually run: past env assignments, shell keywords, the given wrappers with their
+    flags (and those flags' values), `timeout`'s duration and `--`. Wrappers are matched by name, so
+    /usr/bin/env counts as env."""
     while words:
         w = words[0]
-        if re.match(r"^[A-Za-z_]\w*=", w) or w == "--":
+        name = os.path.basename(w)
+        if re.match(r"^[A-Za-z_]\w*=", w) or w == "--" or w in SHELL_KEYWORDS:
             words = words[1:]
-        elif tuple(words[:2]) in TWO_WORD_WRAPPERS:
+        elif tuple(words[:2]) in TWO_WORD_WRAPPERS and "npm-exec" in wrappers:
             words = words[2:]
-        elif w in WRAPPERS:
+        elif name in wrappers:
+            if name == "command" and len(words) > 1 and words[1] in ("-v", "-V"):
+                return []  # `command -v x` only looks x up
+            value_flags = WRAPPERS.get(name, set())
             words = words[1:]
-            while words and (words[0].startswith("-") and words[0] != "--"):
-                words = words[1:]
-            if w == "timeout" and words and re.match(r"^\d", words[0]):
+            while words and words[0].startswith("-") and words[0] != "--":
+                words = words[2:] if words[0] in value_flags else words[1:]
+            if name == "timeout" and words and re.match(r"^\d", words[0]):
                 words = words[1:]
         else:
             break
     return words
 
 
-def script_args(args):
-    """The script files a runner is given: the first file argument, or every one after `--test` (node's test runner
-    takes several). Later arguments are the script's own input, not code."""
-    files = []
-    many = "--test" in args
+def script_args(runner, args):
+    """The script files a runner is given: the first file argument, or every one when `--test` (node's test runner,
+    which takes several) comes before it. Later arguments are the script's own input, not code."""
+    family = RUNNER_FAMILY.get(runner, runner)
+    inline, values = INLINE_CODE_FLAGS.get(family, set()), VALUE_FLAGS.get(family, set())
+    files, many, skip = [], False, False
     for a in args:
-        if a in INLINE_CODE_FLAGS:
+        if skip:
+            skip = False
+            continue
+        if a in inline or (family == "perl" and re.match(r"^-\w*[eE]\w*$", a)):
             break
-        if a.startswith("-"):
+        if a in values:
+            skip = True
+            continue
+        if a == "--test" and not files:
+            many = True
+            continue
+        if a.startswith("-") or a.startswith("+"):
             continue
         if a.endswith(SCRIPT_EXT):
             files.append(a)
             if not many:
                 break
-        elif not many and files:
-            break
+        else:
+            break  # a bare word that isn't a script: a subcommand or the script's own input
     return files
+
+
+def is_shebang_script(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(2) == b"#!"
+    except OSError:
+        return False
 
 
 def run_targets(tokens, here, budget):
     """Paths of the code a segment runs: the folder of an npm test/start/exec or npx, the scripts it runs and the code
-    they import by path. [] if it runs none. `budget` is a one-item list: imports still allowed for this command."""
+    they import by path. [] if it runs none. `budget` is a two-item list for this command: imports and scripts
+    still allowed."""
     words, skip = [], False
     for tok in tokens:  # leave out redirects and their targets (`> out.txt`, `<<HEREDOC`)
         if skip:
@@ -513,21 +554,24 @@ def run_targets(tokens, here, budget):
             skip = True
         else:
             words.append(tok)
-    while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
-        words = words[1:]
+    words = strip_wrappers(words, {w for w in WRAPPERS if w not in PKG_WRAPPERS})
     paths = []
     if words and RUN_TOOLS.match(" ".join([words[0]] + without_dir_flags(words[0], words[1:]))):
         paths.append(pkg_dir(words[0], words[1:], here))
-    words = strip_wrappers(words)
+    words = strip_wrappers(words, set(WRAPPERS) | {"npm-exec"})
     if not words:
         return paths
-    if "/" in words[0] and os.path.isfile(resolve(words[0], here)):
-        scripts = [words[0]]  # run directly, through its shebang
-    elif os.path.basename(words[0]) in RUNNERS:
-        scripts = script_args(words[1:])
+    runner = os.path.basename(words[0])
+    if runner in RUNNERS:
+        scripts = script_args(runner, words[1:])
+    elif "/" in words[0] and os.path.isfile(resolve(words[0], here)) and is_shebang_script(resolve(words[0], here)):
+        scripts = [words[0]]  # a script run directly, through its shebang
     else:
         return paths
     for a in scripts:
+        if budget[1] <= 0:
+            break
+        budget[1] -= 1
         f = os.path.realpath(resolve(a, here))
         if not os.path.isfile(f):
             continue
@@ -540,6 +584,8 @@ def run_targets(tokens, here, budget):
 def imported_paths(script, budget):
     """Where a JS/TS script's relative or absolute imports point outside its own checkout (bare package names, and
     imports within the same checkout, are left out). Resolved from the script's real folder, as Node does."""
+    if budget[0] <= 0:
+        return []
     try:
         if os.path.getsize(script) > MAX_SCRIPT_BYTES:
             return []
@@ -549,12 +595,12 @@ def imported_paths(script, budget):
     own = toplevel(script)
     out = []
     for _q, spec in IMPORT_SPEC.findall(read_text(script) or ""):
-        if budget[0] <= 0:
-            break
-        budget[0] -= 1
         target = resolve(spec, base)
         if own and (target == own or target.startswith(own + os.sep)):
             continue
+        if budget[0] <= 0:
+            break
+        budget[0] -= 1
         out.append(target)
     return out
 
@@ -653,7 +699,7 @@ def main():
     tops = []
     for p in candidate_paths(data.get("tool_name") or "", data.get("tool_input") or {}, data.get("cwd") or ""):
         top = toplevel(p)
-        if top and top not in tops:
+        if top and top not in tops and not is_tool_checkout(os.path.realpath(top)):
             tops.append(top)
     if not tops:
         return
