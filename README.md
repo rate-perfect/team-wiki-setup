@@ -93,11 +93,14 @@ Optional settings for the repo rules hook:
   section headed `# Never change a main checkout` to your own
   `~/.claude/CLAUDE.md`, outside the team block, saying what you allow. The
   hook then refuses edits, commits, branch switches, installs and builds in a
-  repo's main checkout (npm commands that install, remove, link, rebuild,
-  create a package or run scripts, such as `npm ci` or `npm run build`; every
-  `pnpm` or `yarn` command including `pnpm test`; `make`; `dotnet`; also when
-  `--prefix`, `-C`, `--dir`, `--cwd` or `--directory` points at it) and quotes
-  your section back. Running its code with `npm test`,
+  repo's main checkout and quotes your section back: the common npm commands
+  that install, remove, link, rebuild, create a package or run a script (such
+  as `npm ci`, `npm add` or `npm run build`; not `npm publish`, `npm pack` or
+  `npm audit fix`), every `pnpm` or `yarn` command including `pnpm test`,
+  `make` and `dotnet`, also when `--prefix`, `-C`, `--dir`, `--cwd` or
+  `--directory` points at it. Like before, it reads each command as written: a
+  build behind `timeout`, `env` or a shell keyword (`if …; then`) isn't
+  refused. Running its code with `npm test`,
   `npm start`, `npx` or a script only reads it, so that's allowed. Delete the section to turn it
   off.
 

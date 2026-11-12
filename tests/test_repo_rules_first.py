@@ -82,7 +82,8 @@ class RepoRulesFirst(unittest.TestCase):
         self.assertEqual(done.stderr, "", "the hook failed to load")
         log = os.path.join(self.home, ".claude", "hooks", "state", "repo-rules-first", "errors.log")
         if os.path.exists(log):
-            crashes = [line for line in read(log).splitlines() if re.search(r"\d \w+(Error|Exception)\b", line)]
+            # The log holds crashes and "gave up after N blocks" notes; anything else is a crash.
+            crashes = [line for line in read(log).splitlines() if line.strip() and " gave up after " not in line]
             self.assertEqual(crashes, [], "the hook crashed")
         return json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"] if out else None
 
@@ -110,7 +111,9 @@ class RepoRulesFirst(unittest.TestCase):
 
     def test_builds_pointed_at_other_repo(self):
         self.mark_read(os.path.join(self.a, "CLAUDE.md"))
-        for cmd in ("npm --prefix ../repo-b test", "npm --prefix ../repo-b run build", "pnpm --dir=../repo-b build", "pnpm -C ../repo-b test",
+        for cmd in ("npm --prefix ../repo-b test", "npm --prefix ../repo-b run build", "pnpm --dir=../repo-b build",
+                    "npm run build --prefix ../repo-b", "npm i -D x --prefix ../repo-b", "pnpm add x --dir ../repo-b",
+                    "yarn add x --cwd ../repo-b", "pnpm -C ../repo-b test",
                     "yarn --cwd ../repo-b test", "make -C ../repo-b", "cd ../repo-b && npm test",
                     "cd ../repo-b && npx tsc --noEmit"):
             self.assert_paused_for(self.run_hook(cmd), self.b, cmd)
@@ -160,7 +163,9 @@ class RepoRulesFirst(unittest.TestCase):
                     "env -C ../repo-b node scripts/run.ts", "{ cd ../repo-b && npm test; }",
                     "env --chdir=../repo-b node scripts/run.ts", "env -C../repo-b node scripts/run.ts",
                     "env -u FOO -C ../repo-b node scripts/run.ts", "pnpm -C ../repo-b exec tsx scripts/run.ts",
-                    "cd ../repo-b && npm restart", "npm --prefix ../repo-b --omit dev ci"):
+                    "cd ../repo-b && npm restart", "npm --prefix ../repo-b --omit dev ci",
+                    "timeout 60 env -C ../repo-b npm test", "nice env -C ../repo-b node scripts/run.ts",
+                    "env -iC ../repo-b node scripts/run.ts"):
             self.assert_paused_for(self.run_hook(cmd), self.b, cmd)
 
     def test_a_scripts_own_input_isnt_code(self):
@@ -174,7 +179,8 @@ class RepoRulesFirst(unittest.TestCase):
                     "python3 -mjson.tool ../repo-b/data.py", "python3 - ../repo-b/data.py", "bash -s ../repo-b/x.sh",
                     "node a.ts --test ../repo-b/scripts/run.ts", "node a.ts build ../repo-b/scripts/run.ts",
                     "node build ../repo-b/scripts/run.ts", "npm run build -- --prefix ../repo-b",
-                    "pnpm run build --dir ../repo-b", "node a.ts env -C ../repo-b"):
+                    "pnpm run build --dir ../repo-b", "pnpm build --dir ../repo-b", "node a.ts env -C ../repo-b",
+                    "npx prettier --prefix ../repo-b --check x"):
             self.assertIsNone(self.run_hook(cmd), f"{cmd!r}: repo B's file is only input")
 
     def test_nothing_from_outside_any_checkout(self):
@@ -218,6 +224,9 @@ class RepoRulesFirst(unittest.TestCase):
         write(os.path.join(self.b, "node_modules", "prettier", "bin.js"), "1;\n")
         for cmd in ("../repo-b/node_modules/.bin/prettier --check src", "node ../repo-b/node_modules/prettier/bin.js"):
             self.assertIsNone(self.run_hook(cmd, cwd=wt), cmd)
+            # From a checkout whose rules aren't read, it pauses for that checkout, not for repo B.
+            r = self.run_hook(cmd, cwd=self.a)
+            self.assertIn(f"run code in {self.a}", r or "", cmd)
         # A dependency linked from another repo's source (`npm link`) is that repo's code.
         os.symlink(self.b, os.path.join(self.a, "node_modules", "b"))
         self.assert_paused_for(self.run_hook("node node_modules/b/scripts/run.ts", cwd=wt), self.b, "npm link")
@@ -290,6 +299,25 @@ class RepoRulesFirst(unittest.TestCase):
         files.append(os.path.join(self.b, "scripts", "run.ts"))
         self.assertIsNone(self.run_hook("node --test " + " ".join(files)), "the 201st script isn't looked at")
 
+    def test_scripts_run_through_a_folder_flag_and_repos_in_odd_folders(self):
+        # `pnpm -C <repo> exec tsx <script>`: the script is found in <repo>, and its imports are followed.
+        c = os.path.join(self.tmp, "repo-c")
+        write(os.path.join(c, "CLAUDE.md"), "# C rules\n")
+        write(os.path.join(c, "x.ts"), "export const x = 1;\n")
+        git("init", "-q", cwd=c)
+        write(os.path.join(self.b, "scripts", "uses-c.ts"), 'import { x } from "../../repo-c/x";\n')
+        self.mark_read(os.path.join(self.a, "CLAUDE.md"), os.path.join(self.b, "CLAUDE.md"))
+        session = uuid.uuid4().hex
+        cmd = "pnpm -C ../repo-b exec tsx scripts/uses-c.ts"
+        self.run_hook(cmd, session=session)  # lists repo B's skills once
+        self.assert_paused_for(self.run_hook(cmd, session=session), c, "the imported repo")
+        # A repo that sits in a folder named venv keeps its scripts: only folders below a checkout are dependencies.
+        odd = os.path.join(self.tmp, "venv", "tools")
+        write(os.path.join(odd, "CLAUDE.md"), "# Tools rules\n")
+        write(os.path.join(odd, "run.py"), "print(1)\n")
+        git("init", "-q", cwd=odd)
+        self.assert_paused_for(self.run_hook("python3 ../venv/tools/run.py"), odd, "a repo under venv/")
+
     # --- the main checkout guard ---
 
     def test_main_checkout_guard_refuses_builds_there_but_not_running_its_code(self):
@@ -308,7 +336,10 @@ class RepoRulesFirst(unittest.TestCase):
                     f"npm --prefix {self.b} init -y"):
             r = self.run_hook(cmd, cwd=outside, session=session)
             self.assertTrue(r and r.startswith("MAIN CHECKOUT"), f"{cmd}: refused there too")
-        # A build after `cd` into a worktree, behind a shell keyword or a wrapper, is not refused for the main checkout.
+        r = self.run_hook(f"cd {self.b} && npm ci", cwd=outside, session=session)
+        self.assertTrue(r and r.startswith("MAIN CHECKOUT"), "a build after cd into it is refused")
+        # The guard reads segments as main does: a build behind a shell keyword or a wrapper isn't refused at all.
+        # The rules check still follows the `cd` into the worktree and asks for the worktree's rules.
         wt = os.path.join(self.tmp, "repo-b-wt")
         git("worktree", "add", "-q", "-b", "wt", wt, cwd=self.b)
         for cmd in ("if cd ../repo-b-wt; then pnpm install; fi", "env -C ../repo-b-wt npm ci"):

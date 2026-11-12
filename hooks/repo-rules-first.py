@@ -154,7 +154,8 @@ def candidate_paths(tool, ti, cwd):
     here = cwd
     budget = [MAX_IMPORTS_PER_COMMAND, MAX_SCRIPTS_PER_COMMAND]
     for tokens in shell_segments(cmd):
-        # `if cd x; then ...`, `{ cd x && ...; }`. (The main checkout guard deliberately reads segments as before.)
+        # `if cd x; then ...`, `{ cd x && ...; }`. The main checkout guard deliberately reads segments as main does,
+        # so it doesn't see a build behind a shell keyword or a wrapper (`timeout`, `env`) at all.
         while tokens and tokens[0] in SHELL_KEYWORDS:
             tokens = tokens[1:]
         if tokens and tokens[0] == "cd":
@@ -454,19 +455,39 @@ def pkg_dir(cmd, args, here):
     return here
 
 
+# pnpm and yarn commands that pass the arguments after their first word to a script or binary (`pnpm run build
+# --dir x` hands --dir to the build script). Anything that isn't one of their built-ins is an implicit script.
+PASS_THROUGH = {"run", "run-script", "exec", "dlx", "x", "workspace"}
+PNPM_YARN_BUILTINS = {"add", "install", "i", "remove", "rm", "uninstall", "update", "up", "upgrade", "list", "ls",
+                      "why", "outdated", "link", "ln", "unlink", "import", "rebuild", "rb", "prune", "store", "fetch",
+                      "audit", "config", "init", "create", "publish", "pack", "info", "cache", "global", "workspaces",
+                      "dedupe", "patch", "env", "setup", "licenses", "bin", "root", "deploy", "recursive", "-r"}
+
+
 def own_args(cmd, args):
-    """The package tool's own arguments: up to `--`, and for npm, pnpm and yarn up to the script or command name
-    after the subcommand (`npm run build -- --prefix x` passes --prefix to the script). make takes flags anywhere."""
+    """The package tool's own arguments, where its folder flag is read. npm reads its flags anywhere before `--`;
+    npx up to the package it runs; pnpm and yarn read them anywhere for their built-ins, but for a script
+    (`run <script>`, `exec <bin>`, or an implicit script such as `pnpm build`) only up to the script's name. make
+    takes flags anywhere."""
     value_flags = set(DIR_FLAGS.get(cmd, ())) | (NPM_VALUE_FLAGS if cmd == "npm" else set())
-    out, positionals = [], 0
+    out, positionals, first = [], 0, None
     for a in args:
         if a == "--":
             break
-        if cmd != "make" and not a.startswith("-") and (not out or out[-1] not in value_flags):
+        if not a.startswith("-") and (not out or out[-1] not in value_flags):
             positionals += 1
-            if positionals > 1:
-                break
+            if cmd == "npx":
+                out.append(a)
+                break  # the package npx runs; the rest is that package's
+            if cmd in ("pnpm", "yarn"):
+                if positionals == 1:
+                    first = a
+                elif first in PASS_THROUGH:
+                    break  # `pnpm run <script> ...`: past the script's name
         out.append(a)
+        if cmd in ("pnpm", "yarn") and first and positionals == 1 and a == first and first not in PASS_THROUGH \
+                and first not in PNPM_YARN_BUILTINS:
+            break  # an implicit script (`pnpm build ...`, `pnpm test ...`): the rest is the script's
     return out
 
 
@@ -514,6 +535,14 @@ MAX_IMPORTS_PER_COMMAND = 300
 MAX_SCRIPTS_PER_COMMAND = 200
 
 
+def takes_value(flag, value_flags):
+    """True if `flag` is followed by its value: one of `value_flags`, or a short-flag group ending in one (`-iC`)."""
+    if flag in value_flags:
+        return True
+    short = {f[1] for f in value_flags if len(f) == 2}
+    return bool(re.match(r"^-[a-zA-Z]+$", flag)) and len(flag) > 2 and flag[-1] in short
+
+
 def strip_wrappers(words, wrappers):
     """The words from the command actually run: past env assignments, shell keywords, the given wrappers with their
     flags (and those flags' values), `timeout`'s duration and `--`. Wrappers are matched by name, so
@@ -533,7 +562,7 @@ def strip_wrappers(words, wrappers):
             value_flags = WRAPPERS.get(name, set())
             words = words[1:]
             while words and words[0].startswith("-") and words[0] != "--":
-                words = words[2:] if words[0] in value_flags else words[1:]
+                words = words[2:] if takes_value(words[0], value_flags) else words[1:]
             if name == "timeout" and words and re.match(r"^\d", words[0]):
                 words = words[1:]
         else:
@@ -572,11 +601,51 @@ def script_args(runner, args):
     return files
 
 
+def drop_dir_flags(cmd, args):
+    """args without the tool's folder flag and its value (wherever they are among its own arguments)."""
+    flags, own = DIR_FLAGS.get(cmd, ()), len(own_args(cmd, args))
+    out, skip = [], False
+    for i, a in enumerate(args):
+        if i >= own:
+            out.append(a)
+        elif skip:
+            skip = False
+        elif a in flags:
+            skip = True
+        elif not any(attached_value(a, f) for f in flags):
+            out.append(a)
+    return out
+
+
 def env_chdir(words, here):
-    """The folder `env -C <dir> cmd` (or --chdir) runs cmd in, if the segment's command is env; else `here`."""
-    rest = [w for w in words if not re.match(r"^[A-Za-z_]\w*=", w)]
-    if not rest or os.path.basename(rest[0]) != "env":
-        return here
+    """The folder `env -C <dir> cmd` (or --chdir) runs cmd in, if the command is env, also behind other wrappers
+    (`timeout 60 env -C <dir> ...`); else `here`."""
+    i = 0
+    while i < len(words):
+        w, name = words[i], os.path.basename(words[i])
+        if re.match(r"^[A-Za-z_]\w*=", w) or w in SHELL_KEYWORDS:
+            i += 1
+        elif name in NON_PKG_WRAPPERS and name != "env":
+            i += 1
+            while i < len(words) and words[i].startswith("-") and words[i] != "--":
+                i += 2 if takes_value(words[i], WRAPPERS[name]) else 1
+            if name == "timeout" and i < len(words) and re.match(r"^\d", words[i]):
+                i += 1
+        elif name == "env":
+            i += 1
+            while i < len(words) and words[i].startswith("-") and words[i] != "--":
+                a = words[i]
+                if (a in ("-C", "--chdir") or re.match(r"^-[a-zA-Z]+C$", a)) and i + 1 < len(words):
+                    return resolve(words[i + 1], here)  # also a short-flag group ending in C (`env -iC <dir>`)
+                if a.startswith("--chdir="):
+                    return resolve(a[len("--chdir="):], here)
+                if a.startswith("-C") and len(a) > 2:
+                    return resolve(a[2:], here)
+                i += 2 if a in WRAPPERS["env"] else 1
+            return here
+        else:
+            return here
+    return here
     args, i = rest[1:], 0
     while i < len(args) and args[i].startswith("-") and args[i] != "--":
         a = args[i]
@@ -618,6 +687,12 @@ def run_targets(tokens, here, budget):
     # without wrappers (segment_targets); this is for the rules check only.
     if words and (RUN_TOOLS.match(" ".join(tool_args)) or PKG_TOOLS.match(" ".join(tool_args))):
         paths.append(pkg_dir(words[0], words[1:], here))
+    if words and words[0] in DIR_FLAGS and words[0] != "make":
+        # `pnpm -C <dir> exec tsx x.ts`: pnpm and yarn run it in <dir>; for every tool, take the folder flag out so
+        # `pnpm exec` / `npm exec` / `npx` below are seen as the wrappers they are.
+        if words[0] in ("pnpm", "yarn"):
+            here = pkg_dir(words[0], words[1:], here)
+        words = [words[0]] + drop_dir_flags(words[0], words[1:])
     words = strip_wrappers(words, set(WRAPPERS) | {"npm-exec"})
     if not words:
         return paths
@@ -635,11 +710,13 @@ def run_targets(tokens, here, budget):
         f = os.path.realpath(resolve(a, here))
         if not os.path.isfile(f):
             continue
-        if DEPENDENCY_DIR.search(f):
+        top_f = toplevel(f)
+        if DEPENDENCY_DIR.search(f[len(top_f):] if top_f and f.startswith(top_f + os.sep) else f):
             # An installed tool (./node_modules/.bin/vitest, .venv/bin/pytest, or another repo's) runs on behalf of
             # the folder the command runs in, as npx does: it's a dependency, not that repo's own code. Decided on the
-            # real path, so a worktree that links node_modules from its main checkout is covered, and a package
-            # linked from another repo's source (`npm link`, whose real path leaves node_modules) counts for it.
+            # real path below its checkout, so a worktree that links node_modules from its main checkout is covered,
+            # a package linked from another repo's source (`npm link`, whose real path leaves node_modules) counts
+            # for it, and a repo that merely sits in a folder named venv keeps its scripts.
             paths.append(here)
             continue
         paths.append(f)
