@@ -415,7 +415,7 @@ def segment_targets(tokens, here):
     elif cmd in LAST_ARG_WRITERS and plain:
         targets.append(resolve(plain[-1], here))
     elif PKG_TOOLS.match(" ".join([cmd] + without_dir_flags(cmd, args))):
-        targets.append(pkg_dir(cmd, args, here))
+        targets += pkg_dirs(cmd, args, here)
     return targets
 
 
@@ -442,23 +442,48 @@ def without_dir_flags(cmd, args):
     return out
 
 
-def pkg_dir(cmd, args, here):
-    """The folder a package tool works in: the one a --prefix/--dir/--cwd/-C flag names, else the current one."""
+def dir_flag(cmd, args, here):
+    """The folder a --prefix/--dir/--cwd/-C flag names among the tool's own arguments, or None, and whether it comes
+    before the tool's subcommand (its first word that isn't a flag)."""
     flags = DIR_FLAGS.get(cmd, ())
-    for i, a in enumerate(own_args(cmd, args)):
+    value_flags = set(flags) | TOOL_VALUE_FLAGS.get(cmd, set())
+    own = own_args(cmd, args)
+    seen_word = False
+    for i, a in enumerate(own):
         for f in flags:
             if a == f and i + 1 < len(args):
-                return resolve(args[i + 1], here)
+                return resolve(args[i + 1], here), not seen_word
             value = attached_value(a, f)
             if value:
-                return resolve(value, here)
-    return here
+                return resolve(value, here), not seen_word
+        if not a.startswith("-") and (i == 0 or own[i - 1] not in value_flags):
+            seen_word = True
+    return None, True
 
 
-# pnpm and yarn subcommands that hand the arguments after the next word to a script or binary (`pnpm run build
-# --dir x` passes --dir to the build script). For everything else they read their flags anywhere before `--`; this
-# also reads them for an implicit script (`pnpm build --dir x`), which passes them on: a rare extra pause, chosen
-# over guessing which words are built-in commands.
+def pkg_dirs(cmd, args, here):
+    """The folders a package tool may work in. Usually one: the folder its flag names, else the current one. pnpm and
+    yarn read their own flags only before the subcommand for some commands (an implicit script such as `pnpm build
+    --dir x` runs here and passes --dir on) and anywhere for others (`pnpm add y --dir x` works in x). Telling those
+    apart needs their command lists, so a flag after the subcommand counts for both folders: the guard refuses if
+    either is a main checkout (as it refused any pnpm/yarn command here before), and the rules check asks for both."""
+    folder, before = dir_flag(cmd, args, here)
+    if folder is None:
+        return [here]
+    if cmd in ("pnpm", "yarn") and not before:
+        return [here, folder]
+    return [folder]
+
+
+def pkg_dir(cmd, args, here):
+    """The one folder a package tool surely works in (for finding the scripts it runs): its flag's folder when that
+    is unambiguous, else the current one."""
+    dirs = pkg_dirs(cmd, args, here)
+    return dirs[-1] if len(dirs) == 1 else here
+
+
+# pnpm and yarn subcommands that surely hand the arguments after the next word to a script or binary (`pnpm run
+# build --dir x` passes --dir to the build script). Other flags after a subcommand count both ways (pkg_dirs).
 PASS_THROUGH = {"run", "run-script", "exec", "dlx", "x"}
 # Flags before the subcommand that take a value, so the value isn't taken for the subcommand (`pnpm --filter web
 # --dir <dir> build`).
@@ -508,7 +533,7 @@ def attached_value(arg, flag):
 # change it).
 RUNNERS = {"node", "tsx", "ts-node", "bun", "deno", "python", "python3", "bash", "sh", "zsh", "ruby", "perl"}
 # Words that run the rest of the line as a command, and which of their flags take a value (`nice -n 10`).
-WRAPPERS = {"env": {"-u", "--unset", "-C", "--chdir", "-S"}, "time": set(), "nice": {"-n"}, "exec": {"-a"},
+WRAPPERS = {"env": {"-u", "--unset", "-C", "--chdir", "-S", "-P"}, "time": set(), "nice": {"-n"}, "exec": {"-a"},
             "timeout": {"-k", "--kill-after", "-s", "--signal"}, "command": set(), "npx": {"-p", "--package"},
             "bunx": {"-p", "--package"}}
 TWO_WORD_WRAPPERS = {("npm", "exec"), ("npm", "x"), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "exec")}
@@ -538,6 +563,17 @@ MAX_IMPORTS_PER_COMMAND = 300
 MAX_SCRIPTS_PER_COMMAND = 200
 
 
+def subcommand(cmd, args):
+    """A package tool's first word that isn't a flag or a flag's value (`pnpm --filter web exec` -> exec)."""
+    value_flags = set(DIR_FLAGS.get(cmd, ())) | TOOL_VALUE_FLAGS.get(cmd, set())
+    prev = None
+    for a in args:
+        if not a.startswith("-") and prev not in value_flags:
+            return a
+        prev = a
+    return None
+
+
 def takes_value(flag, value_flags):
     """True if `flag` is followed by its value: one of `value_flags`, or a short-flag group ending in one (`-iC`)."""
     if flag in value_flags:
@@ -562,8 +598,8 @@ def strip_wrappers(words, wrappers):
         name = os.path.basename(w)
         if re.match(r"^[A-Za-z_]\w*=", w) or w == "--" or w in SHELL_KEYWORDS:
             words = words[1:]
-        elif tuple(words[:2]) in TWO_WORD_WRAPPERS and "npm-exec" in wrappers:
-            words = words[2:]
+        elif "npm-exec" in wrappers and (w, subcommand(w, words[1:])) in TWO_WORD_WRAPPERS:
+            words = words[words.index(subcommand(w, words[1:]), 1) + 1:]
             while words and words[0].startswith("-") and words[0] != "--":
                 words = words[2:] if words[0] in TWO_WORD_VALUE_FLAGS else words[1:]
         elif name in wrappers:
@@ -645,9 +681,17 @@ def env_chdir(words, here):
             i += 1
             while i < len(words) and words[i].startswith("-") and words[i] != "--":
                 a = words[i]
-                group_c = re.match(r"^-[a-zA-Z]+C$", a) and takes_value(a, WRAPPERS["env"])
-                if (a in ("-C", "--chdir") or group_c) and i + 1 < len(words):
-                    return resolve(words[i + 1], here)  # also a short-flag group ending in C (`env -iC <dir>`)
+                if a in ("-C", "--chdir") and i + 1 < len(words):
+                    return resolve(words[i + 1], here)
+                if re.match(r"^-[a-zA-Z]{2,}", a):
+                    # A short-flag group: its first letter that takes a value decides (`-iC <dir>`, `-iC<dir>`).
+                    short = {f[1] for f in WRAPPERS["env"] if len(f) == 2}
+                    k = next((k for k, ch in enumerate(a[1:], start=1) if ch in short), None)
+                    if k is not None and a[k] == "C":
+                        if k + 1 < len(a):
+                            return resolve(a[k + 1:], here)
+                        if i + 1 < len(words):
+                            return resolve(words[i + 1], here)
                 if a.startswith("--chdir="):
                     return resolve(a[len("--chdir="):], here)
                 if a.startswith("-C") and len(a) > 2:
@@ -686,7 +730,7 @@ def run_targets(tokens, here, budget):
     # Builds and runs, also behind wrappers (`timeout 600 npm run test`). The main checkout guard reads builds
     # without wrappers (segment_targets); this is for the rules check only.
     if words and (RUN_TOOLS.match(" ".join(tool_args)) or PKG_TOOLS.match(" ".join(tool_args))):
-        paths.append(pkg_dir(words[0], words[1:], here))
+        paths += pkg_dirs(words[0], words[1:], here)
     if words and words[0] in DIR_FLAGS and words[0] != "make":
         # `pnpm -C <dir> exec tsx x.ts`: pnpm and yarn run it in <dir>; for every tool, take the folder flag out so
         # `pnpm exec` / `npm exec` / `npx` below are seen as the wrappers they are.

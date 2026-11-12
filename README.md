@@ -43,7 +43,8 @@ doesn't tell their subcommands apart).
 Running a repo's code also counts, from any folder, so work started in one repo
 follows another repo's rules when it touches it:
 - a build or test pointed at it (`npm --prefix <repo> test`, `npm -C`,
-  `pnpm --dir <repo> build`, `yarn --cwd`, `make -C <repo>`, `env -C <repo>`),
+  `pnpm --dir <repo> build`, `yarn --cwd`, `make -C <repo>`, `env -C <repo>`;
+  for pnpm and yarn, a flag after the subcommand counts for both folders),
   and `npm test`, `npm start`/`restart`/`stop`, `npm exec` or `npx` run inside it, also behind
   `timeout`, `time` or `env`;
 - a script run with `node`, `tsx`, `python`, `bash` and the like (also through
@@ -98,7 +99,10 @@ Optional settings for the repo rules hook:
   as `npm ci`, `npm add` or `npm run build`; not `npm publish`, `npm pack` or
   `npm audit fix`), every `pnpm` or `yarn` command including `pnpm test`,
   `make` and `dotnet`, also when `--prefix`, `-C`, `--dir`, `--cwd` or
-  `--directory` points at it. Like before, it reads each command as written: a
+  `--directory` points at it. pnpm and yarn ignore their own flags after some
+  subcommands (`pnpm build --dir x` builds in the current folder), so for them a
+  flag after the subcommand counts for both folders. Like before, it reads each
+  command as written: a
   build behind `timeout`, `env` or a shell keyword (`if …; then`) isn't
   refused. Running its code with `npm test`,
   `npm start`, `npx` or a script only reads it, so that's allowed. Delete the section to turn it

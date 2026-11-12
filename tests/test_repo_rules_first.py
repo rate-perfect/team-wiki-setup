@@ -169,7 +169,8 @@ class RepoRulesFirst(unittest.TestCase):
                     "cd ../repo-b && npm restart", "npm --prefix ../repo-b --omit dev ci",
                     "timeout 60 env -C ../repo-b npm test", "nice env -C ../repo-b node scripts/run.ts",
                     "env -iC ../repo-b node scripts/run.ts", "env -uC node ../repo-b/scripts/run.ts",
-                    "npx --package tsx --prefix ../repo-b tsx scripts/run.ts"):
+                    "npx --package tsx --prefix ../repo-b tsx scripts/run.ts", "env -iC../repo-b node scripts/run.ts",
+                    "env -P /usr/bin node ../repo-b/scripts/run.ts"):
             self.assert_paused_for(self.run_hook(cmd), self.b, cmd)
 
     def test_a_scripts_own_input_isnt_code(self):
@@ -315,6 +316,11 @@ class RepoRulesFirst(unittest.TestCase):
         cmd = "pnpm -C ../repo-b exec tsx scripts/uses-c.ts"
         self.run_hook(cmd, session=session)  # lists repo B's skills once
         self.assert_paused_for(self.run_hook(cmd, session=session), c, "the imported repo")
+        # Flags between pnpm and exec don't hide the script it runs.
+        self.assert_paused_for(self.run_hook("pnpm --filter web exec tsx ../repo-c/x.ts"), c, "pnpm --filter web exec")
+        # A flag after an implicit script: the script runs here, so this folder counts too.
+        r = self.run_hook(f"cd ../repo-b && pnpm build --dir {self.scratch}", session=uuid.uuid4().hex)
+        self.assertIn(f"run code in {self.b}", r or "")
         # A repo that sits in a folder named venv keeps its scripts: only folders below a checkout are dependencies.
         odd = os.path.join(self.tmp, "venv", "tools")
         write(os.path.join(odd, "CLAUDE.md"), "# Tools rules\n")
@@ -346,7 +352,14 @@ class RepoRulesFirst(unittest.TestCase):
         # The rules check still follows the `cd` into the worktree and asks for the worktree's rules.
         wt = os.path.join(self.tmp, "repo-b-wt")
         git("worktree", "add", "-q", "-b", "wt", wt, cwd=self.b)
-        for cmd in ("if cd ../repo-b-wt; then pnpm install; fi", "env -C ../repo-b-wt npm ci"):
+        # pnpm and yarn ignore their own flags after an implicit script (`pnpm build --dir x` builds here), so a flag
+        # after the subcommand doesn't take the guard's eye off the main checkout.
+        for cmd in ("pnpm build --dir ../repo-b-wt", "yarn test --cwd ../repo-b-wt", "pnpm lint --fix -C ../repo-b-wt",
+                    "yarn workspace web build --cwd ../repo-b-wt"):
+            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
+            self.assertTrue(r and r.startswith("MAIN CHECKOUT"), f"{cmd}: refused for the main checkout")
+        for cmd in ("if cd ../repo-b-wt; then pnpm install; fi", "env -C ../repo-b-wt npm ci",
+                    "pnpm --dir ../repo-b-wt build"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
             self.assertIsNotNone(r, cmd)
             self.assertIn(f"run code in {wt}", r, f"{cmd}: the worktree's rules, not a main checkout refusal")
