@@ -37,6 +37,8 @@ git -C <main checkout> worktree add ../team-wiki-setup-<short-name> origin/main 
 
 - `python3 tests/test_worktree_cleanup.py` passes. New or changed `worktree-cleanup` behaviour
   has a test.
+- `python3 tests/test_repo_rules_first.py` passes. New or changed `hooks/repo-rules-first.py`
+  behaviour has a test.
 - `shellcheck` is clean on the shell scripts you changed.
 - `README.md` still says what the code does.
 - Re-running `install.sh` is still safe, and it still never loses the person's own settings.

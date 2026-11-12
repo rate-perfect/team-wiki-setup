@@ -8,6 +8,11 @@ rule docs. It then blocks the change until each rule file shows up in this sessi
 Claude Code ("Contents of <file>") or opened with Read. Small rule sets are shown in full in the block message
 instead, which counts as read. The repo stays the single source of truth.
 
+Running code in a checkout counts too, even from another folder: a build or test pointed at it (`npm --prefix
+<dir> test`, `pnpm --dir <dir> build`, `make -C <dir>`), or a script run with node, tsx, python and the like that
+lives in it or imports its code by a relative or absolute path. So work started in repo A follows repo B's rules
+when it touches repo B. The listing also names the checkout's skills (.claude/skills/<name>/SKILL.md).
+
 Wired as a PreToolUse hook on Edit|Write|NotebookEdit|Bash (user settings), and SessionStart(compact) with --reset
 so the check runs again after the conversation is compacted.
 
@@ -144,7 +149,8 @@ def candidate_paths(tool, ti, cwd):
             if len(tokens) > 1 and "$" not in tokens[1]:
                 here = resolve(tokens[1], here)
             continue
-        paths += [t for t in segment_targets(tokens, here) if "$" not in t and not t.startswith(SCRATCH_PREFIXES)]
+        found = segment_targets(tokens, here) + run_targets(tokens, here)
+        paths += [t for t in found if "$" not in t and not t.startswith(SCRATCH_PREFIXES)]
     return paths
 
 
@@ -192,6 +198,13 @@ def extras(top):
         if items:
             rows.append(f"{rel}/ (use the matching command or agent rather than improvising its steps):")
             rows.extend(items)
+    skills_dir = os.path.join(top, ".claude", "skills")
+    if os.path.isdir(skills_dir):
+        skills = [f"  - .claude/skills/{n}: {describe(os.path.join(skills_dir, n, 'SKILL.md'))}"
+                  for n in sorted(os.listdir(skills_dir)) if os.path.isfile(os.path.join(skills_dir, n, "SKILL.md"))]
+        if skills:
+            rows.append(".claude/skills/ (use the matching skill for its task rather than improvising its steps):")
+            rows.extend(skills)
     nested = []
     for dirpath, dirnames, filenames in os.walk(top):
         depth = dirpath[len(top):].count(os.sep)
@@ -264,7 +277,8 @@ def unread(files, data):
 def header(top, reason="this session has not read that checkout's own rules yet"):
     branch = git(["rev-parse", "--abbrev-ref", "HEAD"], top) or "?"
     head = git(["rev-parse", "--short", "HEAD"], top) or "?"
-    return (f"REPO RULES FIRST: you are about to change {top} (branch {branch}, {head}). The call was paused "
+    return (f"REPO RULES FIRST: you are about to change or run code in {top} (branch {branch}, {head}). The call was "
+            f"paused "
             f"because {reason}. ")
 
 
@@ -284,6 +298,11 @@ FILE_WRITERS = {"rm", "touch", "mkdir", "tee", "truncate", "patch", "rmdir", "ch
 LAST_ARG_WRITERS = {"cp", "mv", "ln", "rsync", "install"}
 PKG_TOOLS = re.compile(r"^(?:dotnet\s+(?:add|remove|new|format|build|restore|test|publish|run)|npm\s+(?:install|i|ci|"
                        r"uninstall|version|run)|pnpm\s+\S+|yarn\s*\S*|poetry\s+\S+|make\b)")
+# More commands that run a checkout's code. For the rules check only: the main checkout guard keeps PKG_TOOLS.
+RUN_TOOLS = re.compile(r"^(?:npm\s+(?:run-script|test|t|start|exec|x)|npx\s+\S+)")
+# Flags that point a package tool at another folder: `npm --prefix <dir> test`, `pnpm --dir <dir> build`, ...
+DIR_FLAGS = {"npm": ("--prefix",), "npx": ("--prefix",), "pnpm": ("--dir", "-C"), "yarn": ("--cwd",),
+             "make": ("-C", "--directory")}
 
 
 def main_rule_text():
@@ -372,9 +391,95 @@ def segment_targets(tokens, here):
         targets += [resolve(a, here) for a in plain] or [here]
     elif cmd in LAST_ARG_WRITERS and plain:
         targets.append(resolve(plain[-1], here))
-    elif PKG_TOOLS.match(" ".join(words)):
-        targets.append(here)
+    elif PKG_TOOLS.match(" ".join([cmd] + without_dir_flags(cmd, args))):
+        targets.append(pkg_dir(cmd, args, here))
     return targets
+
+
+def without_dir_flags(cmd, args):
+    """args without the folder flag and its value, so `npm --prefix <dir> test` reads as `npm test`."""
+    flags = DIR_FLAGS.get(cmd, ())
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a in flags:
+            skip = True
+        elif not any(a.startswith(f + "=") for f in flags if len(f) > 2):
+            out.append(a)
+    return out
+
+
+def pkg_dir(cmd, args, here):
+    """The folder a package tool works in: the one a --prefix/--dir/--cwd/-C flag names, else the current one."""
+    flags = DIR_FLAGS.get(cmd, ())
+    for i, a in enumerate(args):
+        for f in flags:
+            if a == f and i + 1 < len(args):
+                return resolve(args[i + 1], here)
+            if a.startswith(f + "=") and len(f) > 2:
+                return resolve(a[len(f) + 1:], here)
+    return here
+
+
+# ---- Code a command runs ---------------------------------------------------------------------------------------------
+# Running a script counts as working in the checkout it lives in, and in every checkout it imports code from by path.
+# So do npm test/start/exec and npx, in the folder they work in.
+# This is for the rules check only; the main checkout guard ignores it (running code reads a checkout, it doesn't
+# change it).
+RUNNERS = {"node", "tsx", "ts-node", "bun", "deno", "python", "python3", "bash", "sh", "zsh", "ruby", "perl"}
+WRAPPERS = {"npx", "bunx", "env", "time", "nice", "exec"}
+SCRIPT_EXT = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".tsx", ".jsx", ".py", ".sh", ".rb", ".pl")
+JS_EXT = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".tsx", ".jsx")
+IMPORT_SPEC = re.compile(r"""(?:\bfrom\s+|\bimport\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)(['"])([./][^'"]*)\1""", re.M)
+MAX_SCRIPT_BYTES = 1_000_000
+MAX_IMPORTS = 200
+
+
+def run_targets(tokens, here):
+    """Paths of the code a segment runs: the folder of an npm test/start/exec or npx, the scripts it runs and the code
+    they import by path. [] if it runs none."""
+    words, skip = [], False
+    for tok in tokens:  # leave out redirects and their targets (`> out.txt`, `<<HEREDOC`)
+        if skip:
+            skip = False
+        elif tok in (">", ">>", ">|", "<", "<<", "<<<"):
+            skip = True
+        else:
+            words.append(tok)
+    while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
+        words = words[1:]
+    paths = []
+    if words and RUN_TOOLS.match(" ".join([words[0]] + without_dir_flags(words[0], words[1:]))):
+        paths.append(pkg_dir(words[0], words[1:], here))
+    while words and words[0] in WRAPPERS:
+        words = words[1:]
+    if not words or os.path.basename(words[0]) not in RUNNERS:
+        return paths
+    for a in words[1:]:
+        if a.startswith("-") or not a.endswith(SCRIPT_EXT):
+            continue
+        f = resolve(a, here)
+        if not os.path.isfile(f):
+            continue
+        paths.append(f)
+        if f.endswith(JS_EXT):
+            paths += imported_paths(f)
+    return paths
+
+
+def imported_paths(script):
+    """Where a JS/TS script's relative or absolute imports point (bare package names are left out)."""
+    try:
+        if os.path.getsize(script) > MAX_SCRIPT_BYTES:
+            return []
+    except OSError:
+        return []
+    base = os.path.dirname(script)
+    out = []
+    for _q, spec in IMPORT_SPEC.findall(read_text(script) or "")[:MAX_IMPORTS]:
+        out.append(resolve(spec, base))
+    return out
 
 
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\s*(?=\n|$)", re.S)

@@ -36,7 +36,14 @@ different folder. If Claude hasn't read them, the hook pauses the change and
 shows the rules (or names the files to read). The hook holds no rules of its
 own, so each repo stays the source of truth. Commands that only read (such
 as `git status`, `cat` or `grep`) are not paused; builds, tests and package
-commands (`npm run`, `pnpm`, `make`, `dotnet test`) count as changes. It needs
+commands (`npm run`, `npm test`, `npx`, `pnpm`, `make`, `dotnet test`) count as
+changes. So does running a repo's code from anywhere: a build pointed at it
+(`npm --prefix <repo> test`, `pnpm --dir <repo> build`, `make -C <repo>`), or a
+script run with `node`, `tsx`, `python` and the like that lives in the repo or
+imports its code by path. So work started in one repo follows another repo's
+rules when it touches that repo. Text alone (a heredoc, a commit message)
+never counts. The hook also lists the repo's commands, agents and skills
+(`.claude/skills`), so their steps are followed rather than improvised. It needs
 `python3`, lets everything through if it hits an error, and never pauses the
 same repo more than 4 times per session.
 
