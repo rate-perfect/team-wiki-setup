@@ -328,6 +328,17 @@ class RepoRulesFirst(unittest.TestCase):
         git("init", "-q", cwd=odd)
         self.assert_paused_for(self.run_hook("python3 ../venv/tools/run.py"), odd, "a repo under venv/")
 
+    def test_repeated_folder_flags_count_once_for_the_rules(self):
+        # The tools use the last of repeated folder flags, so only that repo's rules are asked for.
+        c = os.path.join(self.tmp, "repo-c")
+        write(os.path.join(c, "CLAUDE.md"), "# C rules\n")
+        git("init", "-q", cwd=c)
+        self.mark_read(os.path.join(self.a, "CLAUDE.md"))
+        for cmd in ("npm --prefix ../repo-c --prefix ../repo-b test", "make -C ../repo-c -C ../repo-b"):
+            r = self.run_hook(cmd)
+            self.assert_paused_for(r, self.b, cmd)
+            self.assertNotIn("C rules", r)
+
     # --- the main checkout guard ---
 
     def test_main_checkout_guard_refuses_builds_there_but_not_running_its_code(self):
@@ -366,8 +377,15 @@ class RepoRulesFirst(unittest.TestCase):
                     f"npm ci --prefix ../repo-b-wt --prefix {self.b}"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
             self.assertTrue(r and r.startswith("MAIN CHECKOUT"), f"{cmd}: refused for the main checkout")
-        r = self.run_hook(f"make -C ../repo-b-wt -C {self.b}", cwd=wt, session=uuid.uuid4().hex)
-        self.assertTrue(r and r.startswith("MAIN CHECKOUT"), "make's -C flags chain, even from the worktree")
+        # From the worktree, where only flags can point at the main checkout: repeated relative flags, make's chained
+        # and grouped -C, and npm's -C=.
+        for cmd in ("make -C .. -C repo-b", "make -sC ../repo-b install", "make -kC../repo-b",
+                    "npm ci --prefix . --prefix ../repo-b", "pnpm --dir . install --dir ../repo-b", "npm -C=../repo-b ci"):
+            r = self.run_hook(cmd, cwd=wt, session=uuid.uuid4().hex)
+            self.assertTrue(r and r.startswith("MAIN CHECKOUT"), f"{cmd}: from the worktree, refused")
+        for cmd in ("make -C=../repo-b",):  # make takes the folder "=../repo-b": not the main checkout
+            r = self.run_hook(cmd, cwd=wt, session=uuid.uuid4().hex)
+            self.assertTrue(r is None or not r.startswith("MAIN CHECKOUT"), cmd)
         # npm reads a folder flag fully: pointed at a worktree, it works there.
         for cmd in ("if cd ../repo-b-wt; then pnpm install; fi", "env -C ../repo-b-wt npm ci",
                     "npm --prefix ../repo-b-wt ci"):

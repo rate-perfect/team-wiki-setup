@@ -99,10 +99,11 @@ Optional settings for the repo rules hook:
   as `npm ci`, `npm add` or `npm run build`; not `npm publish`, `npm pack` or
   `npm audit fix`), every `pnpm` or `yarn` command including `pnpm test`,
   `make` and `dotnet`, also when `--prefix`, `-C`, `--dir`, `--cwd` or
-  `--directory` points at it. It refuses everything it refused before this
-  change, in the current folder, and a folder flag can only add a refusal
-  (every flag counts, `make -C` flags chain, and `-C<dir>` written as one word
-  counts only for make). Like before, it reads each command as written: a
+  `--directory` points at it. It reads the command as written for the current
+  folder, which also refuses a few read-only commands that start with those
+  words (such as `npm info`), and a folder flag can only add a refusal (every
+  flag counts, `make -C` flags chain, and `-C<dir>` written as one word counts
+  only for make). It reads each command as written: a
   build behind `timeout`, `env` or a shell keyword (`if …; then`) isn't
   refused. Running its code with `npm test`,
   `npm start`, `npx` or a script only reads it, so that's allowed. Delete the section to turn it

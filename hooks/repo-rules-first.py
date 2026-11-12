@@ -424,8 +424,11 @@ def segment_targets(tokens, here, guard=False):
         # misread flag can then only add a refusal, never remove one.
         if MAIN_PKG_TOOLS.match(" ".join(words)):
             targets.append(here)
-        if MAIN_PKG_TOOLS.match(" ".join(words)) or PKG_TOOLS.match(" ".join([cmd] + without_dir_flags(cmd, args))):
-            targets += flag_dirs(cmd, args, here) or [here]
+        try:  # reading flags must never cost main's refusal above
+            if MAIN_PKG_TOOLS.match(" ".join(words)) or PKG_TOOLS.match(" ".join([cmd] + without_dir_flags(cmd, args))):
+                targets += flag_dirs(cmd, args, here) or [here]
+        except (ValueError, TypeError, OSError):
+            pass
     elif PKG_TOOLS.match(" ".join([cmd] + without_dir_flags(cmd, args))):
         targets += pkg_dirs(cmd, args, here)
     return targets
@@ -460,6 +463,10 @@ def flag_dirs(cmd, args, here):
     return [d for d, _before in flag_dirs_with_position(cmd, args, here)]
 
 
+# make's short flags that take a value; in a group (`-sC dir`) the first of them takes the rest.
+MAKE_VALUE_LETTERS = set("CfIoW")
+
+
 def flag_dirs_with_position(cmd, args, here):
     """flag_dirs, each with whether it comes before the tool's subcommand (its first word that isn't a flag)."""
     flags = DIR_FLAGS.get(cmd, ())
@@ -470,13 +477,19 @@ def flag_dirs_with_position(cmd, args, here):
         value = None
         if a in flags and i + 1 < len(own):
             value = own[i + 1]
+        elif cmd == "make" and re.match(r"^-[a-zA-Z]{2,}", a):
+            # A make short-flag group: its first letter that takes a value decides (`-sC dir`, `-sCdir`).
+            k = next((k for k, ch in enumerate(a[1:], start=1) if ch in MAKE_VALUE_LETTERS), None)
+            if k is not None and a[k] == "C":
+                value = a[k + 1:] or (own[i + 1] if i + 1 < len(own) else None)
         else:
             for f in flags:
                 if len(f) > 2:
                     value = attached_value(a, f) or value
                 elif cmd == "make" or a.startswith(f + "="):
+                    # make takes `-C=x` as the folder "=x"; npm and pnpm read `-C=x` as x.
                     v = attached_value(a, f)
-                    value = (v[1:] if v and v.startswith("=") else v) or value
+                    value = (v[1:] if v and v.startswith("=") and cmd != "make" else v) or value
         if value:
             folder = resolve(value, base)
             if cmd == "make":
@@ -488,17 +501,21 @@ def flag_dirs_with_position(cmd, args, here):
 
 
 def pkg_dirs(cmd, args, here):
-    """The folders a package tool may work in, for the rules check: every folder its flags name, or the current one.
-    pnpm and yarn ignore their own flags after some subcommands (an implicit script such as `pnpm build --dir x`
-    runs here) and read them after others (`pnpm add y --dir x`), so with a flag after the subcommand the current
-    folder counts too. At worst that asks for one more repo's rules."""
+    """The folders a package tool may work in, for the rules check: the folder its last folder flag names, or the
+    current one. pnpm and yarn ignore their own flags after some subcommands (an implicit script such as `pnpm build
+    --dir x` runs here) and read them after others (`pnpm add y --dir x`), so with a flag after the subcommand the
+    folder before it counts too. At worst that asks for one more repo's rules."""
     found = flag_dirs_with_position(cmd, args, here)
     if not found:
         return [here]
-    dirs = [d for d, _ in found]
-    if cmd in ("pnpm", "yarn") and not all(before for _, before in found):
-        dirs.append(here)
-    return list(dict.fromkeys(dirs))
+    # The tools use the last of repeated flags (make chains them, so its last is the chain's end). pnpm and yarn
+    # use the last one before the subcommand, unless a later one is read; with a flag after the subcommand the
+    # current folder counts too, as the flag may be the script's.
+    before = [d for d, b in found if b]
+    after = [d for d, b in found if not b]
+    if cmd in ("pnpm", "yarn") and after:
+        return list(dict.fromkeys(([before[-1]] if before else [here]) + [after[-1]]))
+    return [found[-1][0]]
 
 
 def pkg_dir(cmd, args, here):
