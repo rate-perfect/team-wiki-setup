@@ -321,6 +321,10 @@ PKG_TOOLS = re.compile(r"^(?:dotnet\s+(?:add|remove|new|format|build|restore|tes
                        r"uninstall|un|rm|r|remove|update|up|upgrade|udpate|link|ln|unlink|rebuild|rb|prune|dedupe|ddp|"
                        r"version|run|rum|urn|run-script|install-test|it|install-ci-test|cit|clean-install-test|sit)"
                        r"(?=\s|$)|pnpm\s+\S+|yarn\s*\S*|poetry\s+\S+|make\b)")
+# origin/main's own pattern, read on the command as written. The main checkout guard refuses everything it matches
+# in the current folder, so the guard is never more permissive than it was; folder flags only add refusals.
+MAIN_PKG_TOOLS = re.compile(r"^(?:dotnet\s+(?:add|remove|new|format|build|restore|test|publish|run)|npm\s+(?:install|i|"
+                            r"ci|uninstall|version|run)|pnpm\s+\S+|yarn\s*\S*|poetry\s+\S+|make\b)")
 # More commands that run a checkout's code. For the rules check only: the main checkout guard keeps PKG_TOOLS.
 RUN_TOOLS = re.compile(r"^(?:npm\s+(?:test|t|tst|start|restart|stop|exec|x)(?=\s|$)|npx\s+\S+)")
 # Flags that point a package tool at another folder: `npm --prefix <dir> test`, `pnpm --dir <dir> build`, ...
@@ -372,8 +376,9 @@ def resolve(path, here):
     return os.path.normpath(path if os.path.isabs(path) else os.path.join(here or "/", path))
 
 
-def segment_targets(tokens, here):
-    """Folders a single shell segment would change, or [] if it changes nothing."""
+def segment_targets(tokens, here, guard=False):
+    """Folders a single shell segment would change, or [] if it changes nothing. `guard`: read builds the way the
+    main checkout guard does (never more permissive than main); otherwise as the rules check does."""
     if not tokens:
         return []
     targets = []
@@ -414,6 +419,13 @@ def segment_targets(tokens, here):
         targets += [resolve(a, here) for a in plain] or [here]
     elif cmd in LAST_ARG_WRITERS and plain:
         targets.append(resolve(plain[-1], here))
+    elif guard:
+        # Whatever main refused here is still refused here, and any folder a folder flag names is checked too. A
+        # misread flag can then only add a refusal, never remove one.
+        if MAIN_PKG_TOOLS.match(" ".join(words)):
+            targets.append(here)
+        if MAIN_PKG_TOOLS.match(" ".join(words)) or PKG_TOOLS.match(" ".join([cmd] + without_dir_flags(cmd, args))):
+            targets += flag_dirs(cmd, args, here) or [here]
     elif PKG_TOOLS.match(" ".join([cmd] + without_dir_flags(cmd, args))):
         targets += pkg_dirs(cmd, args, here)
     return targets
@@ -442,44 +454,58 @@ def without_dir_flags(cmd, args):
     return out
 
 
-def dir_flag(cmd, args, here):
-    """The folder a --prefix/--dir/--cwd/-C flag names among the tool's own arguments, or None, and whether it comes
-    before the tool's subcommand (its first word that isn't a flag)."""
+def flag_dirs(cmd, args, here):
+    """Every folder a --prefix/--dir/--cwd/-C flag names among the tool's own arguments, in order. make's -C flags
+    chain (`make -C a -C b` is a/b). An attached short form (`-C<dir>`) counts only for make: npm and pnpm ignore it."""
+    return [d for d, _before in flag_dirs_with_position(cmd, args, here)]
+
+
+def flag_dirs_with_position(cmd, args, here):
+    """flag_dirs, each with whether it comes before the tool's subcommand (its first word that isn't a flag)."""
     flags = DIR_FLAGS.get(cmd, ())
     value_flags = set(flags) | TOOL_VALUE_FLAGS.get(cmd, set())
     own = own_args(cmd, args)
-    seen_word = False
+    out, seen_word, base = [], False, here
     for i, a in enumerate(own):
-        for f in flags:
-            if a == f and i + 1 < len(args):
-                return resolve(args[i + 1], here), not seen_word
-            value = attached_value(a, f)
-            if value:
-                return resolve(value, here), not seen_word
-        if not a.startswith("-") and (i == 0 or own[i - 1] not in value_flags):
+        value = None
+        if a in flags and i + 1 < len(own):
+            value = own[i + 1]
+        else:
+            for f in flags:
+                if len(f) > 2:
+                    value = attached_value(a, f) or value
+                elif cmd == "make" or a.startswith(f + "="):
+                    v = attached_value(a, f)
+                    value = (v[1:] if v and v.startswith("=") else v) or value
+        if value:
+            folder = resolve(value, base)
+            if cmd == "make":
+                base = folder
+            out.append((folder, not seen_word))
+        elif not a.startswith("-") and (i == 0 or own[i - 1] not in value_flags):
             seen_word = True
-    return None, True
+    return out
 
 
 def pkg_dirs(cmd, args, here):
-    """The folders a package tool may work in. Usually one: the folder its flag names, else the current one. pnpm and
-    yarn read their own flags only before the subcommand for some commands (an implicit script such as `pnpm build
-    --dir x` runs here and passes --dir on) and anywhere for others (`pnpm add y --dir x` works in x). Telling those
-    apart needs their command lists, so a flag after the subcommand counts for both folders: the guard refuses if
-    either is a main checkout (as it refused any pnpm/yarn command here before), and the rules check asks for both."""
-    folder, before = dir_flag(cmd, args, here)
-    if folder is None:
+    """The folders a package tool may work in, for the rules check: every folder its flags name, or the current one.
+    pnpm and yarn ignore their own flags after some subcommands (an implicit script such as `pnpm build --dir x`
+    runs here) and read them after others (`pnpm add y --dir x`), so with a flag after the subcommand the current
+    folder counts too. At worst that asks for one more repo's rules."""
+    found = flag_dirs_with_position(cmd, args, here)
+    if not found:
         return [here]
-    if cmd in ("pnpm", "yarn") and not before:
-        return [here, folder]
-    return [folder]
+    dirs = [d for d, _ in found]
+    if cmd in ("pnpm", "yarn") and not all(before for _, before in found):
+        dirs.append(here)
+    return list(dict.fromkeys(dirs))
 
 
 def pkg_dir(cmd, args, here):
     """The one folder a package tool surely works in (for finding the scripts it runs): its flag's folder when that
     is unambiguous, else the current one."""
     dirs = pkg_dirs(cmd, args, here)
-    return dirs[-1] if len(dirs) == 1 else here
+    return dirs[0] if len(dirs) == 1 else here
 
 
 # pnpm and yarn subcommands that surely hand the arguments after the next word to a script or binary (`pnpm run
@@ -564,14 +590,15 @@ MAX_SCRIPTS_PER_COMMAND = 200
 
 
 def subcommand(cmd, args):
-    """A package tool's first word that isn't a flag or a flag's value (`pnpm --filter web exec` -> exec)."""
+    """A package tool's first word that isn't a flag or a flag's value, and its index in args (`pnpm --filter web
+    exec` -> exec, 2). (None, -1) if there is none."""
     value_flags = set(DIR_FLAGS.get(cmd, ())) | TOOL_VALUE_FLAGS.get(cmd, set())
     prev = None
-    for a in args:
+    for i, a in enumerate(args):
         if not a.startswith("-") and prev not in value_flags:
-            return a
+            return a, i
         prev = a
-    return None
+    return None, -1
 
 
 def takes_value(flag, value_flags):
@@ -598,8 +625,8 @@ def strip_wrappers(words, wrappers):
         name = os.path.basename(w)
         if re.match(r"^[A-Za-z_]\w*=", w) or w == "--" or w in SHELL_KEYWORDS:
             words = words[1:]
-        elif "npm-exec" in wrappers and (w, subcommand(w, words[1:])) in TWO_WORD_WRAPPERS:
-            words = words[words.index(subcommand(w, words[1:]), 1) + 1:]
+        elif "npm-exec" in wrappers and (w, subcommand(w, words[1:])[0]) in TWO_WORD_WRAPPERS:
+            words = words[subcommand(w, words[1:])[1] + 2:]
             while words and words[0].startswith("-") and words[0] != "--":
                 words = words[2:] if words[0] in TWO_WORD_VALUE_FLAGS else words[1:]
         elif name in wrappers:
@@ -836,7 +863,7 @@ def main_checkout_violation(tool, ti, cwd):
             if len(tokens) > 1 and "$" not in tokens[1]:
                 here = resolve(tokens[1], here)
             continue
-        for t in segment_targets(tokens, here):
+        for t in segment_targets(tokens, here, guard=True):
             if "$" in t:
                 continue
             top = toplevel(t)

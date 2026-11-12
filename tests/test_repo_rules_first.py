@@ -358,8 +358,19 @@ class RepoRulesFirst(unittest.TestCase):
                     "yarn workspace web build --cwd ../repo-b-wt"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
             self.assertTrue(r and r.startswith("MAIN CHECKOUT"), f"{cmd}: refused for the main checkout")
+        # Repeated or attached folder flags: the tools use the last one, or ignore `-C<dir>`. The guard refuses all
+        # that main refused, so they can't slip a build in the main checkout past it.
+        for cmd in ("pnpm --dir ../repo-b-wt install --dir .", "pnpm -C ../repo-b-wt -C . install",
+                    "yarn --cwd ../repo-b-wt add foo --cwd .", "pnpm -C../repo-b-wt build", "npm run build -C../repo-b-wt",
+                    "npm run-scr build", "pnpm --dir ../repo-b-wt build", f"make -C ../repo-b-wt -C {self.b}",
+                    f"npm ci --prefix ../repo-b-wt --prefix {self.b}"):
+            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
+            self.assertTrue(r and r.startswith("MAIN CHECKOUT"), f"{cmd}: refused for the main checkout")
+        r = self.run_hook(f"make -C ../repo-b-wt -C {self.b}", cwd=wt, session=uuid.uuid4().hex)
+        self.assertTrue(r and r.startswith("MAIN CHECKOUT"), "make's -C flags chain, even from the worktree")
+        # npm reads a folder flag fully: pointed at a worktree, it works there.
         for cmd in ("if cd ../repo-b-wt; then pnpm install; fi", "env -C ../repo-b-wt npm ci",
-                    "pnpm --dir ../repo-b-wt build"):
+                    "npm --prefix ../repo-b-wt ci"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
             self.assertIsNotNone(r, cmd)
             self.assertIn(f"run code in {wt}", r, f"{cmd}: the worktree's rules, not a main checkout refusal")

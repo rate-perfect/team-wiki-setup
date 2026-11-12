@@ -99,10 +99,10 @@ Optional settings for the repo rules hook:
   as `npm ci`, `npm add` or `npm run build`; not `npm publish`, `npm pack` or
   `npm audit fix`), every `pnpm` or `yarn` command including `pnpm test`,
   `make` and `dotnet`, also when `--prefix`, `-C`, `--dir`, `--cwd` or
-  `--directory` points at it. pnpm and yarn ignore their own flags after some
-  subcommands (`pnpm build --dir x` builds in the current folder), so for them a
-  flag after the subcommand counts for both folders. Like before, it reads each
-  command as written: a
+  `--directory` points at it. It refuses everything it refused before this
+  change, in the current folder, and a folder flag can only add a refusal
+  (every flag counts, `make -C` flags chain, and `-C<dir>` written as one word
+  counts only for make). Like before, it reads each command as written: a
   build behind `timeout`, `env` or a shell keyword (`if …; then`) isn't
   refused. Running its code with `npm test`,
   `npm start`, `npx` or a script only reads it, so that's allowed. Delete the section to turn it
