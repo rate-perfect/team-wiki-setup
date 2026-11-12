@@ -10,6 +10,7 @@ A loose script outside any repo does go under /tmp, as a real scratch script wou
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -72,12 +73,17 @@ class RepoRulesFirst(unittest.TestCase):
         data = {"session_id": session or uuid.uuid4().hex, "transcript_path": self.transcript, "cwd": cwd or self.a,
                 "tool_name": tool, "tool_input": {"command": command} if tool == "Bash" else command}
         env = {**os.environ, "HOME": self.home}
-        out = subprocess.run([sys.executable, HOOK], input=json.dumps(data), capture_output=True, text=True,
-                             env=env, timeout=30).stdout.strip()
-        # The hook fails open: a crash prints nothing, which would pass any "no pause" check. So check its log.
+        # 15 s: Claude Code's timeout for this hook (install.sh).
+        done = subprocess.run([sys.executable, HOOK], input=json.dumps(data), capture_output=True, text=True,
+                              env=env, timeout=15)
+        out = done.stdout.strip()
+        # The hook fails open: a crash prints nothing, which would pass any "no pause" check. A crash inside main()
+        # is logged with its exception's name; one while loading the module shows on stderr.
+        self.assertEqual(done.stderr, "", "the hook failed to load")
         log = os.path.join(self.home, ".claude", "hooks", "state", "repo-rules-first", "errors.log")
-        if os.path.exists(log) and os.path.getsize(log):
-            self.fail(f"the hook crashed: {read(log)}")
+        if os.path.exists(log):
+            crashes = [line for line in read(log).splitlines() if re.search(r"\d \w+(Error|Exception)\b", line)]
+            self.assertEqual(crashes, [], "the hook crashed")
         return json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"] if out else None
 
     def assert_paused_for(self, reason, repo, what):
@@ -151,7 +157,10 @@ class RepoRulesFirst(unittest.TestCase):
                     "time -p node ../repo-b/scripts/run.ts", "npm exec -p tsx -- tsx ../repo-b/scripts/run.ts",
                     "bash -euo pipefail ../repo-b/scripts/tool.sh", "npm --prefix ../repo-b -w pkg run build",
                     "npm --prefix ../repo-b --silent test", "cd ../repo-b && npm cit",
-                    "env -C ../repo-b node scripts/run.ts", "{ cd ../repo-b && npm test; }"):
+                    "env -C ../repo-b node scripts/run.ts", "{ cd ../repo-b && npm test; }",
+                    "env --chdir=../repo-b node scripts/run.ts", "env -C../repo-b node scripts/run.ts",
+                    "env -u FOO -C ../repo-b node scripts/run.ts", "pnpm -C ../repo-b exec tsx scripts/run.ts",
+                    "cd ../repo-b && npm restart", "npm --prefix ../repo-b --omit dev ci"):
             self.assert_paused_for(self.run_hook(cmd), self.b, cmd)
 
     def test_a_scripts_own_input_isnt_code(self):
@@ -164,14 +173,15 @@ class RepoRulesFirst(unittest.TestCase):
                     "python3 -m json.tool ../repo-b/data.py", "command -v ../repo-b/scripts/lookup.sh",
                     "python3 -mjson.tool ../repo-b/data.py", "python3 - ../repo-b/data.py", "bash -s ../repo-b/x.sh",
                     "node a.ts --test ../repo-b/scripts/run.ts", "node a.ts build ../repo-b/scripts/run.ts",
-                    "node build ../repo-b/scripts/run.ts"):
+                    "node build ../repo-b/scripts/run.ts", "npm run build -- --prefix ../repo-b",
+                    "pnpm run build --dir ../repo-b", "node a.ts env -C ../repo-b"):
             self.assertIsNone(self.run_hook(cmd), f"{cmd!r}: repo B's file is only input")
 
     def test_nothing_from_outside_any_checkout(self):
         for cmd in ("npx prettier --check x.ts", "npm token list", "node tool.js"):
             self.assertIsNone(self.run_hook(cmd, cwd=self.scratch), cmd)
         # npm commands that run nothing don't count, even inside a checkout whose rules aren't read.
-        for cmd in ("npm token list", "npm team ls", "npm view left-pad version", "npm info left-pad", "npm init --help"):
+        for cmd in ("npm token list", "npm team ls", "npm view left-pad version", "npm info left-pad"):
             self.assertIsNone(self.run_hook(cmd, cwd=self.b), cmd)
 
     def test_a_runner_given_by_path_is_not_the_code_run(self):
@@ -203,7 +213,12 @@ class RepoRulesFirst(unittest.TestCase):
         self.mark_read(os.path.join(wt, "CLAUDE.md"))
         for cmd in ("./node_modules/.bin/vitest run", "node node_modules/vitest/vitest.mjs", ".venv/bin/pytest -q"):
             self.assertIsNone(self.run_hook(cmd, cwd=wt), f"{cmd}: not the main checkout's code")
-        # A dependency linked from another repo (`npm link`) is that repo's code.
+        # Another repo's installed tool is a dependency, not that repo's code: it runs for the current folder.
+        write(os.path.join(self.b, "node_modules", ".bin", "prettier"), "#!/usr/bin/env node\n")
+        write(os.path.join(self.b, "node_modules", "prettier", "bin.js"), "1;\n")
+        for cmd in ("../repo-b/node_modules/.bin/prettier --check src", "node ../repo-b/node_modules/prettier/bin.js"):
+            self.assertIsNone(self.run_hook(cmd, cwd=wt), cmd)
+        # A dependency linked from another repo's source (`npm link`) is that repo's code.
         os.symlink(self.b, os.path.join(self.a, "node_modules", "b"))
         self.assert_paused_for(self.run_hook("node node_modules/b/scripts/run.ts", cwd=wt), self.b, "npm link")
 
@@ -288,15 +303,18 @@ class RepoRulesFirst(unittest.TestCase):
         self.assertTrue(r.startswith("MAIN CHECKOUT"), "a build in a main checkout is refused, as before")
         self.assertIn(self.b, r, "in the folder --dir names, not the current one")
         for cmd in (f"npm --prefix {self.b} install", f"npm --prefix {self.b} run-script build",
-                    f"npm --prefix {self.b} cit", f"npm --prefix {self.b} --silent ci"):
+                    f"npm --prefix {self.b} cit", f"npm --prefix {self.b} --silent ci",
+                    f"npm --prefix {self.b} isntall", f"npm --prefix {self.b} clean-install",
+                    f"npm --prefix {self.b} init -y"):
             r = self.run_hook(cmd, cwd=outside, session=session)
             self.assertTrue(r and r.startswith("MAIN CHECKOUT"), f"{cmd}: refused there too")
         # A build after `cd` into a worktree, behind a shell keyword or a wrapper, is not refused for the main checkout.
         wt = os.path.join(self.tmp, "repo-b-wt")
         git("worktree", "add", "-q", "-b", "wt", wt, cwd=self.b)
         for cmd in ("if cd ../repo-b-wt; then pnpm install; fi", "env -C ../repo-b-wt npm ci"):
-            r = self.run_hook(cmd, cwd=self.b, session=session)
-            self.assertTrue(r is None or not r.startswith("MAIN CHECKOUT"), f"{cmd}: {r}")
+            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
+            self.assertIsNotNone(r, cmd)
+            self.assertIn(f"run code in {wt}", r, f"{cmd}: the worktree's rules, not a main checkout refusal")
         # Repo B's rules are read and its skills listed by the first pause below; after that nothing pauses.
         self.run_hook(f"npx tsx {self.b}/scripts/run.ts", cwd=outside, session=session)
         self.assertIsNone(self.run_hook(f"npx tsx {self.b}/scripts/run.ts", cwd=outside, session=session),

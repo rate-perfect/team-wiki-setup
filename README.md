@@ -44,7 +44,7 @@ Running a repo's code also counts, from any folder, so work started in one repo
 follows another repo's rules when it touches it:
 - a build or test pointed at it (`npm --prefix <repo> test`, `npm -C`,
   `pnpm --dir <repo> build`, `yarn --cwd`, `make -C <repo>`, `env -C <repo>`),
-  and `npm test`, `npm start`, `npm exec` or `npx` run inside it, also behind
+  and `npm test`, `npm start`/`restart`/`stop`, `npm exec` or `npx` run inside it, also behind
   `timeout`, `time` or `env`;
 - a script run with `node`, `tsx`, `python`, `bash` and the like (also through
   `npx`, `npm exec`, `pnpm dlx`, `env`, `nice` or `timeout`, inside `for`,
@@ -55,9 +55,9 @@ follows another repo's rules when it touches it:
   by a relative or absolute path (only the script's own imports; up to 300
   imports leaving the script's repo per command).
 - a tool installed in the repo you're in, run by path (`./node_modules/.bin/vitest`,
-  `.venv/bin/pytest`), counts for the folder the command runs in, even when a
-  worktree links `node_modules` from its main checkout. A dependency linked
-  from a different repo (`npm link`) counts for that repo.
+  `.venv/bin/pytest`, or another repo's), counts for the folder the command
+  runs in, even when a worktree links `node_modules` from its main checkout. A
+  package linked from another repo's source (`npm link`) counts for that repo.
 
 Text (a heredoc, a commit message) never counts. Runners are known by name, so
 `/opt/homebrew/bin/node` or a virtualenv's `python` is just the runner. Tool
@@ -93,10 +93,11 @@ Optional settings for the repo rules hook:
   section headed `# Never change a main checkout` to your own
   `~/.claude/CLAUDE.md`, outside the team block, saying what you allow. The
   hook then refuses edits, commits, branch switches, installs and builds in a
-  repo's main checkout (`npm install`/`ci`/`run`, every `pnpm` or `yarn`
-  command including `pnpm test`, `make`, `dotnet`; also when `--prefix`, `-C`,
-  `--dir`, `--cwd` or `--directory` points at it) and quotes your section
-  back. Running its code with `npm test`,
+  repo's main checkout (npm commands that install, remove, link, rebuild,
+  create a package or run scripts, such as `npm ci` or `npm run build`; every
+  `pnpm` or `yarn` command including `pnpm test`; `make`; `dotnet`; also when
+  `--prefix`, `-C`, `--dir`, `--cwd` or `--directory` points at it) and quotes
+  your section back. Running its code with `npm test`,
   `npm start`, `npx` or a script only reads it, so that's allowed. Delete the section to turn it
   off.
 
