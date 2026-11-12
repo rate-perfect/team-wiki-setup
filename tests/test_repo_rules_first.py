@@ -113,7 +113,10 @@ class RepoRulesFirst(unittest.TestCase):
         self.mark_read(os.path.join(self.a, "CLAUDE.md"))
         for cmd in ("npm --prefix ../repo-b test", "npm --prefix ../repo-b run build", "pnpm --dir=../repo-b build",
                     "npm run build --prefix ../repo-b", "npm i -D x --prefix ../repo-b", "pnpm add x --dir ../repo-b",
-                    "yarn add x --cwd ../repo-b", "pnpm -C ../repo-b test",
+                    "yarn add x --cwd ../repo-b", "pnpm --filter web --dir ../repo-b build",
+                    "pnpm -F web -C ../repo-b test", "pnpm test --dir ../repo-b",
+                    "yarn --network-timeout 100000 --cwd ../repo-b install",
+                    "pnpm --filter web --dir ../repo-b exec tsx scripts/run.ts", "pnpm -C ../repo-b test",
                     "yarn --cwd ../repo-b test", "make -C ../repo-b", "cd ../repo-b && npm test",
                     "cd ../repo-b && npx tsc --noEmit"):
             self.assert_paused_for(self.run_hook(cmd), self.b, cmd)
@@ -165,7 +168,8 @@ class RepoRulesFirst(unittest.TestCase):
                     "env -u FOO -C ../repo-b node scripts/run.ts", "pnpm -C ../repo-b exec tsx scripts/run.ts",
                     "cd ../repo-b && npm restart", "npm --prefix ../repo-b --omit dev ci",
                     "timeout 60 env -C ../repo-b npm test", "nice env -C ../repo-b node scripts/run.ts",
-                    "env -iC ../repo-b node scripts/run.ts"):
+                    "env -iC ../repo-b node scripts/run.ts", "env -uC node ../repo-b/scripts/run.ts",
+                    "npx --package tsx --prefix ../repo-b tsx scripts/run.ts"):
             self.assert_paused_for(self.run_hook(cmd), self.b, cmd)
 
     def test_a_scripts_own_input_isnt_code(self):
@@ -179,7 +183,7 @@ class RepoRulesFirst(unittest.TestCase):
                     "python3 -mjson.tool ../repo-b/data.py", "python3 - ../repo-b/data.py", "bash -s ../repo-b/x.sh",
                     "node a.ts --test ../repo-b/scripts/run.ts", "node a.ts build ../repo-b/scripts/run.ts",
                     "node build ../repo-b/scripts/run.ts", "npm run build -- --prefix ../repo-b",
-                    "pnpm run build --dir ../repo-b", "pnpm build --dir ../repo-b", "node a.ts env -C ../repo-b",
+                    "pnpm run build --dir ../repo-b", "node a.ts env -C ../repo-b",
                     "npx prettier --prefix ../repo-b --check x"):
             self.assertIsNone(self.run_hook(cmd), f"{cmd!r}: repo B's file is only input")
 
@@ -333,7 +337,7 @@ class RepoRulesFirst(unittest.TestCase):
         for cmd in (f"npm --prefix {self.b} install", f"npm --prefix {self.b} run-script build",
                     f"npm --prefix {self.b} cit", f"npm --prefix {self.b} --silent ci",
                     f"npm --prefix {self.b} isntall", f"npm --prefix {self.b} clean-install",
-                    f"npm --prefix {self.b} init -y"):
+                    f"npm --prefix {self.b} init -y", f"pnpm --filter web --dir {self.b} build"):
             r = self.run_hook(cmd, cwd=outside, session=session)
             self.assertTrue(r and r.startswith("MAIN CHECKOUT"), f"{cmd}: refused there too")
         r = self.run_hook(f"cd {self.b} && npm ci", cwd=outside, session=session)
