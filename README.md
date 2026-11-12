@@ -44,7 +44,8 @@ Running a repo's code also counts, from any folder, so work started in one repo
 follows another repo's rules when it touches it:
 - a build or test pointed at it (`npm --prefix <repo> test`, `npm -C`,
   `pnpm --dir <repo> build`, `yarn --cwd`, `make -C <repo>`, `env -C <repo>`;
-  for pnpm and yarn, a flag after the subcommand counts for both folders),
+  of repeated flags only the last counts; for pnpm and yarn, a flag after the
+  subcommand counts for both folders),
   and `npm test`, `npm start`/`restart`/`stop`, `npm exec` or `npx` run inside it, also behind
   `timeout`, `time` or `env`;
 - a script run with `node`, `tsx`, `python`, `bash` and the like (also through
@@ -102,8 +103,8 @@ Optional settings for the repo rules hook:
   `--directory` points at it. It reads the command as written for the current
   folder, which also refuses a few read-only commands that start with those
   words (such as `npm info`), and a folder flag can only add a refusal (every
-  flag counts, `make -C` flags chain, and `-C<dir>` written as one word counts
-  only for make). It reads each command as written: a
+  flag counts, `make -C` flags chain, `-C<dir>` counts only for make, and
+  `-C=<dir>` counts for npm and pnpm). It reads each command as written: a
   build behind `timeout`, `env` or a shell keyword (`if …; then`) isn't
   refused. Running its code with `npm test`,
   `npm start`, `npx` or a script only reads it, so that's allowed. Delete the section to turn it

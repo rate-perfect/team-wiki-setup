@@ -427,7 +427,7 @@ def segment_targets(tokens, here, guard=False):
         try:  # reading flags must never cost main's refusal above
             if MAIN_PKG_TOOLS.match(" ".join(words)) or PKG_TOOLS.match(" ".join([cmd] + without_dir_flags(cmd, args))):
                 targets += flag_dirs(cmd, args, here) or [here]
-        except (ValueError, TypeError, OSError):
+        except Exception:  # noqa: BLE001 - any error here must leave main's refusal standing
             pass
     elif PKG_TOOLS.match(" ".join([cmd] + without_dir_flags(cmd, args))):
         targets += pkg_dirs(cmd, args, here)
@@ -464,7 +464,7 @@ def flag_dirs(cmd, args, here):
 
 
 # make's short flags that take a value; in a group (`-sC dir`) the first of them takes the rest.
-MAKE_VALUE_LETTERS = set("CfIoW")
+MAKE_VALUE_LETTERS = set("CEfIoW")
 
 
 def flag_dirs_with_position(cmd, args, here):
@@ -515,7 +515,10 @@ def pkg_dirs(cmd, args, here):
     after = [d for d, b in found if not b]
     if cmd in ("pnpm", "yarn") and after:
         return list(dict.fromkeys(([before[-1]] if before else [here]) + [after[-1]]))
-    return [found[-1][0]]
+    # A folder written with a variable can't be resolved here: fall back to the last one that can (for make, the
+    # longest known part of the chain).
+    known = [d for d, _ in found if "$" not in d]
+    return [found[-1][0]] if "$" not in found[-1][0] else (known[-1:] or [here])
 
 
 def pkg_dir(cmd, args, here):

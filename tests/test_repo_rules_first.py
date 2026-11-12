@@ -338,6 +338,9 @@ class RepoRulesFirst(unittest.TestCase):
             r = self.run_hook(cmd)
             self.assert_paused_for(r, self.b, cmd)
             self.assertNotIn("C rules", r)
+        # A last folder written with a variable: the last one that can be resolved counts.
+        for cmd in ("make -C ../repo-c -C $SUB", "npm --prefix ../repo-c --prefix \"$D\" test"):
+            self.assert_paused_for(self.run_hook(cmd), c, cmd)
 
     # --- the main checkout guard ---
 
@@ -349,16 +352,16 @@ class RepoRulesFirst(unittest.TestCase):
         outside = self.scratch
         r = self.run_hook(f"pnpm --dir {self.b} build", cwd=outside, session=session)
         self.assertIsNotNone(r)
-        self.assertTrue(r.startswith("MAIN CHECKOUT"), "a build in a main checkout is refused, as before")
+        self.assertTrue(r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), "refused, as before")
         self.assertIn(self.b, r, "in the folder --dir names, not the current one")
         for cmd in (f"npm --prefix {self.b} install", f"npm --prefix {self.b} run-script build",
                     f"npm --prefix {self.b} cit", f"npm --prefix {self.b} --silent ci",
                     f"npm --prefix {self.b} isntall", f"npm --prefix {self.b} clean-install",
                     f"npm --prefix {self.b} init -y", f"pnpm --filter web --dir {self.b} build"):
             r = self.run_hook(cmd, cwd=outside, session=session)
-            self.assertTrue(r and r.startswith("MAIN CHECKOUT"), f"{cmd}: refused there too")
+            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
         r = self.run_hook(f"cd {self.b} && npm ci", cwd=outside, session=session)
-        self.assertTrue(r and r.startswith("MAIN CHECKOUT"), "a build after cd into it is refused")
+        self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), "after cd into it")
         # The guard reads segments as main does: a build behind a shell keyword or a wrapper isn't refused at all.
         # The rules check still follows the `cd` into the worktree and asks for the worktree's rules.
         wt = os.path.join(self.tmp, "repo-b-wt")
@@ -368,7 +371,7 @@ class RepoRulesFirst(unittest.TestCase):
         for cmd in ("pnpm build --dir ../repo-b-wt", "yarn test --cwd ../repo-b-wt", "pnpm lint --fix -C ../repo-b-wt",
                     "yarn workspace web build --cwd ../repo-b-wt"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
-            self.assertTrue(r and r.startswith("MAIN CHECKOUT"), f"{cmd}: refused for the main checkout")
+            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
         # Repeated or attached folder flags: the tools use the last one, or ignore `-C<dir>`. The guard refuses all
         # that main refused, so they can't slip a build in the main checkout past it.
         for cmd in ("pnpm --dir ../repo-b-wt install --dir .", "pnpm -C ../repo-b-wt -C . install",
@@ -376,13 +379,13 @@ class RepoRulesFirst(unittest.TestCase):
                     "npm run-scr build", "pnpm --dir ../repo-b-wt build", f"make -C ../repo-b-wt -C {self.b}",
                     f"npm ci --prefix ../repo-b-wt --prefix {self.b}"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
-            self.assertTrue(r and r.startswith("MAIN CHECKOUT"), f"{cmd}: refused for the main checkout")
+            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
         # From the worktree, where only flags can point at the main checkout: repeated relative flags, make's chained
         # and grouped -C, and npm's -C=.
         for cmd in ("make -C .. -C repo-b", "make -sC ../repo-b install", "make -kC../repo-b",
                     "npm ci --prefix . --prefix ../repo-b", "pnpm --dir . install --dir ../repo-b", "npm -C=../repo-b ci"):
             r = self.run_hook(cmd, cwd=wt, session=uuid.uuid4().hex)
-            self.assertTrue(r and r.startswith("MAIN CHECKOUT"), f"{cmd}: from the worktree, refused")
+            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
         for cmd in ("make -C=../repo-b",):  # make takes the folder "=../repo-b": not the main checkout
             r = self.run_hook(cmd, cwd=wt, session=uuid.uuid4().hex)
             self.assertTrue(r is None or not r.startswith("MAIN CHECKOUT"), cmd)
