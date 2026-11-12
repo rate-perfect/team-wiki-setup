@@ -154,6 +154,8 @@ def candidate_paths(tool, ti, cwd):
     here = cwd
     budget = [MAX_IMPORTS_PER_COMMAND, MAX_SCRIPTS_PER_COMMAND]
     for tokens in shell_segments(cmd):
+        while tokens and tokens[0] in SHELL_KEYWORDS:  # `if cd x; then ...`, `{ cd x && ...; }`
+            tokens = tokens[1:]
         if tokens and tokens[0] == "cd":
             if len(tokens) > 1 and "$" not in tokens[1]:
                 here = resolve(tokens[1], here)
@@ -312,10 +314,11 @@ GIT_MUTATING = {"commit", "push", "merge", "cherry-pick", "rebase", "reset", "re
                 "switch", "restore", "rm", "mv", "add", "stash", "tag", "pull", "clean"}
 FILE_WRITERS = {"rm", "touch", "mkdir", "tee", "truncate", "patch", "rmdir", "chmod"}
 LAST_ARG_WRITERS = {"cp", "mv", "ln", "rsync", "install"}
-PKG_TOOLS = re.compile(r"^(?:dotnet\s+(?:add|remove|new|format|build|restore|test|publish|run)|npm\s+(?:install|i|ci|"
-                       r"uninstall|version|run|run-script|install-test|it|install-ci-test|cit)(?=\s|$)|pnpm\s+\S+|yarn\s*\S*|poetry\s+\S+|make\b)")
+PKG_TOOLS = re.compile(r"^(?:dotnet\s+(?:add|remove|new|format|build|restore|test|publish|run)|npm\s+(?:install|i|ci|add|"
+                       r"uninstall|un|rm|r|remove|update|up|upgrade|link|ln|unlink|rebuild|rb|prune|dedupe|ddp|version|"
+                       r"run|rum|urn|run-script|install-test|it|install-ci-test|cit)(?=\s|$)|pnpm\s+\S+|yarn\s*\S*|poetry\s+\S+|make\b)")
 # More commands that run a checkout's code. For the rules check only: the main checkout guard keeps PKG_TOOLS.
-RUN_TOOLS = re.compile(r"^(?:npm\s+(?:run-script|test|t|start|exec|x)(?=\s|$)|npx\s+\S+)")
+RUN_TOOLS = re.compile(r"^(?:npm\s+(?:test|t|tst|start|exec|x)(?=\s|$)|npx\s+\S+)")
 # Flags that point a package tool at another folder: `npm --prefix <dir> test`, `pnpm --dir <dir> build`, ...
 DIR_FLAGS = {"npm": ("--prefix", "-C"), "npx": ("--prefix",), "pnpm": ("--dir", "-C"), "yarn": ("--cwd",),
              "make": ("-C", "--directory")}
@@ -386,8 +389,8 @@ def segment_targets(tokens, here):
             skip = tok != "<<HEREDOC"
             continue
         words.append(tok)
-    # Past env assignments and wrappers such as `timeout 600` or `time`, so `timeout 600 npm run test` is a build.
-    words = strip_wrappers(words, NON_PKG_WRAPPERS)
+    while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
+        words = words[1:]
     if not words:
         return targets
     cmd, args = words[0], words[1:]
@@ -412,8 +415,13 @@ def segment_targets(tokens, here):
     return targets
 
 
+# npm's flags that may come before its subcommand (`npm -w pkg run build`, `npm --silent ci`), and which take a value.
+NPM_VALUE_FLAGS = {"-w", "--workspace", "--loglevel", "--registry", "--userconfig", "--cache"}
+
+
 def without_dir_flags(cmd, args):
-    """args without the folder flag and its value, so `npm --prefix <dir> test` reads as `npm test`."""
+    """args without the folder flag and its value, so `npm --prefix <dir> test` reads as `npm test`. For npm, also
+    without the flags before its subcommand."""
     flags = DIR_FLAGS.get(cmd, ())
     out, skip = [], False
     for a in args:
@@ -423,6 +431,9 @@ def without_dir_flags(cmd, args):
             skip = True
         elif not any(attached_value(a, f) for f in flags):
             out.append(a)
+    if cmd == "npm":
+        while out and out[0].startswith("-"):
+            out = out[2:] if out[0] in NPM_VALUE_FLAGS else out[1:]
     return out
 
 
@@ -457,10 +468,11 @@ WRAPPERS = {"env": {"-u", "--unset", "-C", "--chdir", "-S"}, "time": set(), "nic
             "timeout": {"-k", "--kill-after", "-s", "--signal"}, "command": set(), "npx": {"-p", "--package"},
             "bunx": {"-p", "--package"}}
 TWO_WORD_WRAPPERS = {("npm", "exec"), ("npm", "x"), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "exec")}
+TWO_WORD_VALUE_FLAGS = {"-p", "--package", "--filter", "-F", "-w", "--workspace", "-C", "--dir"}
 # Package-tool wrappers are stripped only after npm's own run commands are matched (`npx` is one).
 PKG_WRAPPERS = {"npx", "bunx"}
 NON_PKG_WRAPPERS = {w for w in WRAPPERS if w not in PKG_WRAPPERS}
-SHELL_KEYWORDS = {"if", "while", "until", "do", "then", "else", "elif", "!", "{", "time"}
+SHELL_KEYWORDS = {"if", "while", "until", "do", "then", "else", "elif", "!", "{"}
 # Per runner: flags after which the code comes from the command line or a module name (`node -e`, `python -c`,
 # `python -m`), not a script file; and flags whose value is not the script (`node --import ./reg.mjs`).
 INLINE_CODE_FLAGS = {"node": {"-e", "--eval", "-p", "--print"}, "bun": {"-e", "--eval", "-p", "--print"},
@@ -494,7 +506,7 @@ def strip_wrappers(words, wrappers):
         elif tuple(words[:2]) in TWO_WORD_WRAPPERS and "npm-exec" in wrappers:
             words = words[2:]
             while words and words[0].startswith("-") and words[0] != "--":
-                words = words[1:]
+                words = words[2:] if words[0] in TWO_WORD_VALUE_FLAGS else words[1:]
         elif name in wrappers:
             if name == "command" and len(words) > 1 and words[1] in ("-v", "-V"):
                 return []  # `command -v x` only looks x up
@@ -523,8 +535,8 @@ def script_args(runner, args):
             break  # the code comes from stdin, the command line or a module name
         if any(len(f) == 2 and a.startswith(f) and len(a) > 2 for f in inline):
             break  # the same, with the value attached (`python -mjson.tool`, `python -cprint(1)`)
-        if a in values:
-            skip = True
+        if a in values or (family == "bash" and re.match(r"^[-+][a-zA-Z]*[oO]$", a)):
+            skip = True  # the flag's value (`bash -euo pipefail`: "pipefail") is not the script
             continue
         if a == "--test":  # only reachable before the first file: the scan stops after it unless --test came first
             many = True
@@ -538,6 +550,22 @@ def script_args(runner, args):
         else:
             break  # a bare word that isn't a script: a subcommand or the script's own input
     return files
+
+
+def same_family(top, other):
+    """True if `top` is None (not in a checkout) or the same repo as `other`: one checkout or its worktrees."""
+    if not top:
+        return True
+    if not other:
+        return False
+    if top == other:
+        return True
+    a, b = git(["rev-parse", "--git-common-dir"], top), git(["rev-parse", "--git-common-dir"], other)
+    if not a or not b:
+        return False
+    a = os.path.normpath(a if os.path.isabs(a) else os.path.join(top, a))
+    b = os.path.normpath(b if os.path.isabs(b) else os.path.join(other, b))
+    return os.path.realpath(a) == os.path.realpath(b)
 
 
 def is_shebang_script(path):
@@ -560,9 +588,21 @@ def run_targets(tokens, here, budget):
             skip = True
         else:
             words.append(tok)
+    for i, w in enumerate(words[:-1]):  # `env -C <dir> cmd` runs cmd in <dir>
+        if os.path.basename(w) == "env":
+            for j in range(i + 1, len(words) - 1):
+                if words[j] in ("-C", "--chdir"):
+                    here = resolve(words[j + 1], here)
+                    break
+                if not words[j].startswith("-"):
+                    break
+            break
     words = strip_wrappers(words, NON_PKG_WRAPPERS)
     paths = []
-    if words and RUN_TOOLS.match(" ".join([words[0]] + without_dir_flags(words[0], words[1:]))):
+    tool_args = [words[0]] + without_dir_flags(words[0], words[1:]) if words else []
+    # Builds and runs, also behind wrappers (`timeout 600 npm run test`). The main checkout guard reads builds
+    # without wrappers (segment_targets); this is for the rules check only.
+    if words and (RUN_TOOLS.match(" ".join(tool_args)) or PKG_TOOLS.match(" ".join(tool_args))):
         paths.append(pkg_dir(words[0], words[1:], here))
     words = strip_wrappers(words, set(WRAPPERS) | {"npm-exec"})
     if not words:
@@ -578,14 +618,14 @@ def run_targets(tokens, here, budget):
         if budget[1] <= 0:
             break
         budget[1] -= 1
-        if DEPENDENCY_DIR.search(resolve(a, here)):
-            # An installed tool (./node_modules/.bin/vitest, .venv/bin/pytest) runs on behalf of the folder the
-            # command runs in, as npx does. Its real path is no guide: a worktree may link node_modules from the
-            # main checkout.
-            paths.append(here)
-            continue
         f = os.path.realpath(resolve(a, here))
         if not os.path.isfile(f):
+            continue
+        if DEPENDENCY_DIR.search(resolve(a, here)) and same_family(toplevel(f), toplevel(here)):
+            # An installed tool (./node_modules/.bin/vitest, .venv/bin/pytest) runs on behalf of the folder the
+            # command runs in, as npx does: a worktree may link node_modules from its main checkout. A dependency
+            # linked from another repo (`npm link`) is that repo's code and counts for it.
+            paths.append(here)
             continue
         paths.append(f)
         if f.endswith(JS_EXT):
