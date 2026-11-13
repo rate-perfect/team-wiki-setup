@@ -327,18 +327,43 @@ function splitCommands(command) {
 
 // Splits a simple command into words, removing quotes and backslashes the way the shell does. A
 // `$(...)`, `${...}` or backtick expansion stays whole inside its word, so expandWord can tell it is
-// there.
+// there. Redirections (`2>/dev/null`, `> out.txt`, `2>&1`, `&>log`, `<in`) are left out: they are not
+// arguments, and `git symbolic-ref --short X 2>/dev/null` must not read as a two-argument write.
 function tokenize(simple) {
   const tokens = [];
   let word = null;
+  // True after a redirection operator: the next word is its target, not an argument.
+  let dropNext = false;
   const take = (text) => {
     word = (word ?? "") + text;
+  };
+  const finish = () => {
+    if (word !== null && !dropNext) tokens.push(word);
+    else if (word !== null) dropNext = false;
+    word = null;
   };
   for (let i = 0; i < simple.length; i++) {
     const ch = simple[i];
     if (/\s/.test(ch)) {
-      if (word !== null) tokens.push(word);
+      finish();
+      continue;
+    }
+    if (ch === ">" || ch === "<") {
+      // A single unquoted digit (`2>`) or `&` (`&>`) right before the operator belongs to it. Any other
+      // word before it ends there and stays an argument: `a>b` is `a`, then a redirection; `"2">x` and
+      // `12>x` (zsh reads only one digit as an fd) keep `2` and `12`.
+      if (word !== null && !/(?:^|\s)[\d&]$/.test(simple.slice(0, i))) finish();
       word = null;
+      let j = i + 1;
+      while (j < simple.length && /[>&|]/.test(simple[j])) j++;
+      const op = simple.slice(i, j);
+      // `2>&1`, `>&2`, `<&-`: duplicates an fd, no file word follows.
+      if (/&$/.test(op) && /^(\d+|-)/.test(simple.slice(j))) {
+        while (j < simple.length && /[\d-]/.test(simple[j])) j++;
+      } else {
+        dropNext = true;
+      }
+      i = j - 1;
       continue;
     }
     if (ch === "'") {
@@ -380,7 +405,7 @@ function tokenize(simple) {
     }
     take(ch);
   }
-  if (word !== null) tokens.push(word);
+  finish();
   return tokens;
 }
 
