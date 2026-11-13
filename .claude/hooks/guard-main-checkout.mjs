@@ -9,15 +9,30 @@
 //     ignores the file (CLAUDE.local.md, local settings, plans, checkpoints).
 //   - Bash commands that change a main checkout's files, index or branch are refused: git commit,
 //     add, checkout/switch, merge, pull, reset, stash, rebase, restore, clean and the like,
-//     `gh pr checkout`, and `pnpm release` / `pnpm version` (or release.sh). Allowed: reads, fetch,
-//     worktree add/remove/prune, branch, tag, push, `checkout --detach <ref>` (without --force),
-//     `merge --ff-only origin/<branch>` and `pull --ff-only`.
+//     `gh pr checkout`, and releases and publishes: `pnpm release` / `pnpm version` (or release.sh),
+//     release-it, semantic-release, standard-version, `changeset version` / `changeset publish`,
+//     `bun pm version`, and `npm|pnpm|yarn|bun publish` (also `pnpm m publish`), started the usual
+//     ways (directly, `npx`, `pnpm exec`, `yarn <tool>`, `node .../tool.js`, `eval`). `publish --dry-run` and `release-it --dry-run` are allowed: they
+//     don't publish or bump versions (lifecycle scripts like `prepack` still run). `yarn publish
+//     --dry-run` is refused: Yarn 1's publish has no --dry-run.
+//     Allowed: reads, fetch, worktree add/remove/prune, branch, tag, push, `checkout --detach <ref>`
+//     (without --force), `merge --ff-only origin/<branch>` and `pull --ff-only`.
+//   - The hook reads the command as Claude wrote it, before the shell fills in variables. When a
+//     command that would change a checkout names its folder by something the hook can't work out (a
+//     variable such as $REPO or ${REPO}, or command output such as $(...)), it is refused, wherever
+//     it points: the hook can't tell whether that is a main checkout. Write the path out in full.
+//     Read-only commands with variables are fine. Variables set earlier in the same command, $HOME,
+//     ~, $PWD, $(pwd), $(git rev-parse --show-toplevel) and `cd -` are worked out. A `$` inside
+//     single quotes is treated as a variable too.
 // A main checkout is recognised from the target path itself, so the guard works whichever directory
 // the session started in. Worktrees are never affected. It does nothing in GitHub Actions.
 //
 // It is a guardrail against mistakes, not a security boundary. It reads commands the way Claude
-// writes them, not as a full shell: a path built from a variable it can't resolve, `$(...)` or
-// `xargs git ...`, or a file written by sed/redirection/a generator, is not caught.
+// writes them, not as a full shell. Not caught: `xargs git ...`, `find -exec git ...`, a command
+// inside a quoted "$(...)", a script fed to sh by a heredoc, `make release`, `env -C <dir> git ...`,
+// wrapper options it doesn't know, GIT_DIR / --git-dir pointing at a main checkout's .git from
+// elsewhere, and a file written by sed/redirection/a generator. It reads `( cd <dir> && ... )` as if
+// the cd still applied after the brackets, so a later change can be refused when it would be fine.
 //
 // The SAME file lives in every guarded repo at .claude/hooks/guard-main-checkout.mjs. Change every copy;
 // to guard a new repo, copy it in unchanged and wire it in that repo's .claude/settings.json. A main
@@ -47,9 +62,55 @@ const SAFE_GIT_SUBCOMMANDS = new Set([
 // git global options that take a separate value argument.
 const GIT_OPTS_WITH_VALUE = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"]);
 // Prefixes that run the rest of the command unchanged.
-const PASSTHROUGH_COMMANDS = new Set(["env", "command", "sudo", "time", "nice", "nohup", "exec", "builtin"]);
+const PASSTHROUGH_COMMANDS = new Set(["env", "command", "sudo", "time", "timeout", "nice", "nohup", "exec", "builtin", "corepack"]);
+// Options of those wrappers that take a separate value: `sudo -u ann git ...`, `nice -n 5 git ...`.
+const WRAPPER_OPTS_WITH_VALUE = {
+  sudo: new Set(["-u", "-g", "-h", "-p", "-U", "-C"]),
+  nice: new Set(["-n"]),
+  timeout: new Set(["-s", "-k", "--signal", "--kill-after"]),
+  env: new Set(["-u", "--unset"]),
+};
+// Package-manager options before the subcommand that take a separate value: `pnpm --filter x publish`.
+const PM_OPTS_WITH_VALUE = new Set(["--filter", "-F", "--reporter", "--loglevel", "--registry", "--userconfig", "--cache", "--config", "--workspace-concurrency", "--tag", "--otp", "--access", "--filter-prod", "--resume-from", "--test-pattern", "--changed-files-ignore-pattern"]);
+// Package-manager options known to take no value: the word after one is the subcommand, so
+// `npm -s help publish` is a help command, not a publish. Yarn 1 knows only -s, --silent and --json
+// of these: the others (-r, -q, -p and the like) take the next word as their value there, so
+// `yarn -r x release` runs the release script.
+const PM_FLAGS = new Set(["-s", "--silent", "-q", "--quiet", "--json", "--parseable", "-p", "-r", "--recursive", "-g", "--global", "-y", "--yes", "--long", "-l"]);
+const YARN_FLAGS = new Set(["-s", "--silent", "--json"]);
+// pnpm words before the command that mean -r: `pnpm m publish` is `pnpm -r publish`.
+const PNPM_RECURSIVE_WORDS = new Set(["recursive", "multi", "m"]);
+// Words that make a package-manager command a release or publish.
+const RELEASE_WORDS = new Set(["publish", "release", "version"]);
 const SHELLS = new Set(["bash", "sh", "zsh"]);
+// Shell words that start a command inside `if`, `while`, `for` and the like: `do git add "$f"`.
+const SHELL_KEYWORDS = new Set(["if", "then", "else", "elif", "while", "until", "do", "!"]);
 const RELEASE_SCRIPTS = new Set(["release", "version"]);
+// Script names like `release:patch` and `release:minor` release too.
+const isReleaseScript = (name) => RELEASE_SCRIPTS.has(name) || /^release:/.test(name);
+// A script named `publish` (often `changeset publish`) publishes when run with `run`.
+const isRunReleaseScript = (name) => isReleaseScript(name) || name === "publish";
+// Package-manager subcommands that never publish, even when a release word follows an unknown
+// option: `npm --foo view version`. (`npm pkg set` edits package.json, but doesn't publish.)
+const PM_READ_SUBCOMMANDS = new Set(["view", "info", "show", "pkg"]);
+// Tools that release or publish, by command name. The value lists the subcommands that do; null
+// means every run does.
+const RELEASE_TOOLS = new Map([
+  ["release-it", null],
+  ["semantic-release", null],
+  ["standard-version", null],
+  ["changeset", new Set(["version", "publish"])],
+  ["@changesets/cli", new Set(["version", "publish"])],
+]);
+const PACKAGE_MANAGERS = new Set(["pnpm", "npm", "yarn", "bun"]);
+// Commands that fetch or find a package's tool and run it: `npx release-it`.
+const PACKAGE_RUNNERS = new Set(["npx", "pnpx", "bunx"]);
+// Package-manager subcommands that do the same: `pnpm exec release-it`, `npm x release-it`.
+const EXEC_SUBCOMMANDS = new Set(["exec", "x", "dlx"]);
+// Options of those runners that take a separate value: `npx -p release-it release-it`.
+const RUNNER_OPTS_WITH_VALUE = new Set(["-p", "--package", "-c", "--call", "-w", "--workspace"]);
+// How deep `bash -c "..."` and `$(...)` inside one another are followed.
+const MAX_DEPTH = 4;
 const FORCE_FLAGS = new Set(["-f", "--force", "--discard-changes", "-m", "--merge"]);
 const RISKY_CONFIG_KEYS = /^(core\.(worktree|bare|hookspath))$/i;
 
@@ -102,10 +163,21 @@ function isIgnored(top, file) {
   }
 }
 
-// Expands ~, $HOME and variables assigned earlier in the same command. Returns null when the value
-// still depends on something unknown ($VAR, $(...), backticks), so the caller can skip it.
+// `$(git rev-parse --show-toplevel)`, which Claude often uses to name the repo it is in.
+const TOPLEVEL = /\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)|`\s*git\s+rev-parse\s+--show-toplevel\s*`/g;
+
+// Expands ~, $HOME, $PWD, $(pwd), $(git rev-parse --show-toplevel) and variables assigned earlier in the same command. Returns null
+// when the value still depends on something unknown ($VAR, $(...), backticks), so the caller can
+// treat the path as unknown.
 function expandWord(word, vars) {
   let out = word.replace(/^~(?=$|\/)/, homedir());
+  if (vars.PWD !== undefined) {
+    out = out.replace(/\$\(\s*pwd\s*\)|`\s*pwd\s*`/g, () => vars.PWD);
+    if (out.search(TOPLEVEL) >= 0) {
+      const top = git(vars.PWD, ["rev-parse", "--show-toplevel"]);
+      if (top !== null) out = out.replace(TOPLEVEL, () => top);
+    }
+  }
   out = out.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (m, a, b) => {
     const name = a ?? b;
     return Object.prototype.hasOwnProperty.call(vars, name) ? vars[name] : m;
@@ -113,6 +185,7 @@ function expandWord(word, vars) {
   return /[$`]/.test(out) ? null : out;
 }
 
+// Returns the absolute path a word names, or null when it can't be worked out.
 function resolvePath(word, dir, vars) {
   const expanded = expandWord(word, vars);
   if (expanded === null) return null;
@@ -131,15 +204,60 @@ function stripHeredocs(command) {
       continue;
     }
     kept.push(line);
-    const re = /<<-?\s*(["']?)([A-Za-z_][A-Za-z0-9_]*)\1/g;
+    // `<<<` is a here-string (one word of input), not a heredoc.
+    const re = /(?<!<)<<(?!<)-?\s*(["']?)([A-Za-z_][A-Za-z0-9_]*)\1/g;
     let m;
     while ((m = re.exec(line)) !== null) pending.push(m[2]);
   }
   return kept.join("\n");
 }
 
+const CLOSING = { "(": ")", "{": "}" };
+
+// Returns the index of the bracket that closes the `(` or `{` at `open`, skipping quoted text, or
+// the last index when it is never closed.
+function closingBracket(s, open) {
+  const stack = [CLOSING[s[open]]];
+  let quote = null;
+  for (let i = open + 1; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === "\\" && quote !== "'") i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\") i++;
+    else if (ch === "'" || ch === '"' || ch === "`") quote = ch;
+    else if (ch === "(" || ch === "{") stack.push(CLOSING[ch]);
+    else if (ch === stack[stack.length - 1]) {
+      stack.pop();
+      if (!stack.length) return i;
+    }
+  }
+  return s.length - 1;
+}
+
+// Returns the index of the backtick that closes the one at `open`, or the last index.
+function closingBacktick(s, open) {
+  for (let i = open + 1; i < s.length; i++) {
+    if (s[i] === "\\") i++;
+    else if (s[i] === "`") return i;
+  }
+  return s.length - 1;
+}
+
+// When `s[i]` starts a `$(...)`, `${...}` or backtick expansion, returns the index of its last
+// character, else -1.
+function expansionEnd(s, i) {
+  if (s[i] === "$" && (s[i + 1] === "(" || s[i + 1] === "{")) return closingBracket(s, i + 1);
+  if (s[i] === "`") return closingBacktick(s, i);
+  return -1;
+}
+
 // Splits a shell command into simple commands. Good enough for the commands Claude writes; it is
-// not a shell parser (quoted separators stay whole).
+// not a shell parser (quoted separators stay whole). An unquoted `$(...)`, `${...}` or backtick
+// expansion stays inside its word; the command run by `$(...)` or backticks is also returned on its
+// own, as { sub: "<command>" }, so it is checked too.
 function splitCommands(command) {
   const parts = [];
   let current = "";
@@ -147,6 +265,12 @@ function splitCommands(command) {
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     if (quote) {
+      // Inside "...", a backslash escapes the next character (`\"` doesn't end the quote).
+      if (ch === "\\" && quote === '"') {
+        current += command.slice(i, i + 2);
+        i++;
+        continue;
+      }
       current += ch;
       if (ch === quote) quote = null;
       continue;
@@ -154,6 +278,30 @@ function splitCommands(command) {
     if (ch === "'" || ch === '"') {
       quote = ch;
       current += ch;
+      continue;
+    }
+    if (ch === "\\") {
+      // A backslash before a newline continues the line; before anything else it escapes it.
+      current += command[i + 1] === "\n" ? " " : command.slice(i, i + 2);
+      i++;
+      continue;
+    }
+    // A `#` that starts a word starts a comment, to the end of the line.
+    if (ch === "#" && (i === 0 || /\s/.test(command[i - 1]))) {
+      const newline = command.indexOf("\n", i);
+      if (newline < 0) break;
+      i = newline - 1;
+      continue;
+    }
+    const end = expansionEnd(command, i);
+    if (end >= 0) {
+      const text = command.slice(i, end + 1);
+      if (ch === "`") parts.push({ sub: text.slice(1, -1) });
+      else if (command[i + 1] === "(") parts.push({ sub: text.slice(2, -1) });
+      // `${X:-$(cmd)}`: the commands inside a `${...}` run too.
+      else parts.push(...splitCommands(text.slice(2, -1)).filter((p) => typeof p !== "string"));
+      current += text;
+      i = end;
       continue;
     }
     const two = command.slice(i, i + 2);
@@ -174,14 +322,65 @@ function splitCommands(command) {
     current += ch;
   }
   parts.push(current);
-  return parts.map((p) => p.trim()).filter(Boolean);
+  return parts.map((p) => (typeof p === "string" ? p.trim() : p)).filter((p) => (typeof p === "string" ? p : p.sub.trim()));
 }
 
+// Splits a simple command into words, removing quotes and backslashes the way the shell does. A
+// `$(...)`, `${...}` or backtick expansion stays whole inside its word, so expandWord can tell it is
+// there.
 function tokenize(simple) {
   const tokens = [];
-  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
-  let m;
-  while ((m = re.exec(simple)) !== null) tokens.push(m[1] ?? m[2] ?? m[3]);
+  let word = null;
+  const take = (text) => {
+    word = (word ?? "") + text;
+  };
+  for (let i = 0; i < simple.length; i++) {
+    const ch = simple[i];
+    if (/\s/.test(ch)) {
+      if (word !== null) tokens.push(word);
+      word = null;
+      continue;
+    }
+    if (ch === "'") {
+      const close = simple.indexOf("'", i + 1);
+      const stop = close < 0 ? simple.length : close;
+      take(simple.slice(i + 1, stop));
+      i = stop;
+      continue;
+    }
+    if (ch === '"') {
+      take("");
+      let j = i + 1;
+      while (j < simple.length && simple[j] !== '"') {
+        const end = expansionEnd(simple, j);
+        if (end >= 0) {
+          take(simple.slice(j, end + 1));
+          j = end + 1;
+        } else if (simple[j] === "\\" && /["\\$`]/.test(simple[j + 1] ?? "")) {
+          take(simple[j + 1]);
+          j += 2;
+        } else {
+          take(simple[j]);
+          j += 1;
+        }
+      }
+      i = j;
+      continue;
+    }
+    if (ch === "\\") {
+      take(simple[i + 1] ?? "");
+      i++;
+      continue;
+    }
+    const end = expansionEnd(simple, i);
+    if (end >= 0) {
+      take(simple.slice(i, end + 1));
+      i = end;
+      continue;
+    }
+    take(ch);
+  }
+  if (word !== null) tokens.push(word);
   return tokens;
 }
 
@@ -239,15 +438,70 @@ function parseGit(tokens, dir, vars) {
   return { target, args: tokens.slice(i) };
 }
 
-// Returns a reason when a package-manager or script invocation would release from this directory.
+// Returns the release a release tool would make, e.g. "release-it" or "changeset publish", when
+// `tokens` (the tool, then its arguments) runs one, else null.
+function releaseToolCall(tokens) {
+  if (!tokens.length) return null;
+  // `npx release-it@17` and `npx @changesets/cli@2 publish` name a package and its version.
+  // `node .../semantic-release/bin/semantic-release.js` names the tool's own script.
+  const raw = tokens[0].replace(/(.)@[^/]*$/, "$1").replace(/\.[cm]?js$/, "");
+  const name = raw.startsWith("@") ? raw : basename(raw);
+  if (!RELEASE_TOOLS.has(name)) return null;
+  const releasing = RELEASE_TOOLS.get(name);
+  if (releasing === null) return name;
+  const sub = positional(tokens.slice(1))[0];
+  return sub && releasing.has(sub) ? `${name} ${sub}` : null;
+}
+
+// Skips the options of `npx` / `npm exec` / `pnpm dlx` and the like, up to the command they run.
+function afterRunnerOptions(tokens, i) {
+  while (i < tokens.length && tokens[i].startsWith("-")) {
+    if (tokens[i] === "--") return i + 1;
+    i += RUNNER_OPTS_WITH_VALUE.has(tokens[i]) ? 2 : 1;
+  }
+  return i;
+}
+
+// A publish or a release-it run with --dry-run doesn't publish. Not `changeset publish`, not a
+// script run with `run`, where --dry-run may never reach the tool, and not `yarn publish`: Yarn 1's
+// publish has no --dry-run. `yarn npm publish --dry-run` (or `-n`) dry-runs from Yarn 4.9.3; older
+// Yarn refuses the flag.
+function isDryRun(tokens, what) {
+  const dry = tokens.some((t) => /^--dry-run(=true)?$/.test(t)) || (what === "yarn npm publish" && tokens.includes("-n"));
+  if (!dry) return false;
+  if (/changeset|\srun(-script)?\s/.test(what) || what === "yarn publish") return false;
+  return /(^|\s)(release-it|publish)$/.test(what);
+}
+
+// Returns { target, what } when a package-manager, package-runner or script invocation would release
+// or publish, with target the directory it runs in (null when that can't be worked out), else null.
 function releaseInvocation(tokens, dir, vars) {
+  const hit = findRelease(tokens, dir, vars);
+  return hit && isDryRun(tokens, hit.what) ? null : hit;
+}
+
+function findRelease(tokens, dir, vars) {
   const cmd = basename(tokens[0]);
   if (/release\.sh$/.test(cmd)) return { target: dir, what: tokens[0] };
   if (SHELLS.has(cmd) && tokens[1] && /release\.sh$/.test(tokens[1])) return { target: dir, what: `${cmd} ${tokens[1]}` };
-  if (!["pnpm", "npm", "yarn"].includes(cmd)) return null;
+  // `node [options] <script> ...`: the script is the first word that isn't an option.
+  const nodeScript = tokens.findIndex((t, n) => n > 0 && !t.startsWith("-"));
+  const direct = releaseToolCall(cmd !== "node" ? tokens : nodeScript > 0 ? tokens.slice(nodeScript) : []);
+  if (direct) return { target: dir, what: direct };
+  // `npx -c "release-it --ci"` and `npm exec -c "..."` run the quoted command.
+  const call = tokens.findIndex((t) => t === "-c" || t === "--call");
+  if ((PACKAGE_RUNNERS.has(cmd) || (PACKAGE_MANAGERS.has(cmd) && tokens.some((t) => EXEC_SUBCOMMANDS.has(t)))) && call > 0 && tokens[call + 1]) {
+    const tool = releaseToolCall(tokenize(tokens[call + 1]));
+    if (tool) return { target: dir, what: `${cmd} -c ${tool}` };
+  }
+  if (PACKAGE_RUNNERS.has(cmd)) {
+    const tool = releaseToolCall(tokens.slice(afterRunnerOptions(tokens, 1)));
+    return tool ? { target: dir, what: `${cmd} ${tool}` } : null;
+  }
+  if (!PACKAGE_MANAGERS.has(cmd)) return null;
   let target = dir;
   let i = 1;
-  while (i < tokens.length && tokens[i].startsWith("-")) {
+  while (i < tokens.length && (tokens[i].startsWith("-") || (cmd === "pnpm" && PNPM_RECURSIVE_WORDS.has(tokens[i])))) {
     const opt = tokens[i];
     if (opt === "-C" || opt === "--dir" || opt === "--prefix" || opt === "--cwd") {
       target = resolvePath(tokens[i + 1] ?? ".", dir, vars);
@@ -256,29 +510,71 @@ function releaseInvocation(tokens, dir, vars) {
     }
     const eq = opt.match(/^--(dir|prefix|cwd)=(.*)$/);
     if (eq) target = resolvePath(eq[2], dir, vars);
-    i += 1;
+    // `pnpm --filter <pkg> publish`, `npm -w <pkg> publish`: skip the package name too.
+    const takesValue = PM_OPTS_WITH_VALUE.has(opt) || (cmd === "npm" && (opt === "-w" || opt === "--workspace"));
+    i += takesValue ? 2 : 1;
   }
-  let script = tokens[i];
-  if (script === "run" || script === "run-script") script = tokens[i + 1];
-  return script && RELEASE_SCRIPTS.has(script) ? { target, what: `${cmd} ${script}` } : null;
+  // An option whose value the hook doesn't know (`npm --foo bar publish`): look one word further.
+  const unknownValue = i > 1 && tokens[i - 1].startsWith("-") && !tokens[i - 1].includes("=") && !(cmd === "yarn" ? YARN_FLAGS : PM_FLAGS).has(tokens[i - 1]);
+  if (unknownValue && tokens[i] && !RELEASE_WORDS.has(tokens[i]) && !PM_READ_SUBCOMMANDS.has(tokens[i]) && RELEASE_WORDS.has(tokens[i + 1])) i += 1;
+  // `yarn workspace <pkg> <command>` runs the command in that package.
+  if (cmd === "yarn" && tokens[i] === "workspace") i += 2;
+  const sub = tokens[i];
+  if (!sub) return null;
+  if (sub === "run" || sub === "run-script") {
+    const script = tokens[i + 1];
+    if (script && isRunReleaseScript(script)) return { target, what: `${cmd} run ${script}` };
+    // `yarn run release-it` runs the tool when there is no script of that name.
+    const tool = releaseToolCall(tokens.slice(i + 1));
+    return tool ? { target, what: `${cmd} run ${tool}` } : null;
+  }
+  if (isReleaseScript(sub) || sub === "publish") return { target, what: `${cmd} ${sub}` };
+  if (cmd === "yarn" && sub === "npm" && tokens[i + 1] === "publish") return { target, what: "yarn npm publish" };
+  // `bun pm version patch` bumps the version, then commits and tags it.
+  if (cmd === "bun" && sub === "pm" && tokens[i + 1] === "version") return { target, what: "bun pm version" };
+  // `pnpm exec release-it`, `npm exec -- release-it`, and `yarn release-it` / `pnpm release-it`,
+  // which run a package's tool directly.
+  const exec = EXEC_SUBCOMMANDS.has(sub);
+  const tool = releaseToolCall(tokens.slice(exec ? afterRunnerOptions(tokens, i + 1) : i));
+  return tool ? { target, what: `${cmd} ${exec ? `${sub} ` : ""}${tool}` } : null;
 }
 
-function checkBash(command, cwd, depth = 0) {
-  const vars = { HOME: homedir() };
+// Returns { top, what } for the first part of the command that would change a main checkout, or
+// { top: null, what } for one that would change a checkout the hook can't work out; else null.
+function checkBash(command, cwd, depth = 0, inherited = {}) {
+  const vars = { HOME: homedir(), ...inherited };
   let dir = cwd;
   const dirStack = [];
-  for (const simple of splitCommands(stripHeredocs(command))) {
-    let tokens = tokenize(simple);
+  let previousDir = null;
+  // Where a change goes: the main checkout's top, null for a path the hook can't work out, or
+  // undefined when it is safe (a worktree, another repo, or not a repo).
+  const hitAt = (target, what) => {
+    if (target === null) return { top: null, what };
+    const top = mainCheckoutContaining(target);
+    return top ? { top, what } : undefined;
+  };
+  for (const part of splitCommands(stripHeredocs(command))) {
+    if (dir === null) delete vars.PWD;
+    else vars.PWD = dir;
+    // The command a `$(...)` or backtick runs: checked on its own, in the current directory. A `cd`
+    // inside it doesn't move the rest of the command.
+    if (typeof part !== "string") {
+      const hit = depth < MAX_DEPTH ? checkBash(part.sub, dir, depth + 1, vars) : null;
+      if (hit) return hit;
+      continue;
+    }
+    let tokens = tokenize(part);
+    while (tokens.length && SHELL_KEYWORDS.has(tokens[0])) tokens = tokens.slice(1);
     // VAR=value (alone, or after export/local/declare/readonly) records a variable; before a command
     // it only sets that command's environment.
     if (["export", "local", "declare", "readonly"].includes(tokens[0])) tokens = tokens.slice(1).filter((t) => !t.startsWith("-"));
     if (tokens.length && tokens.every((t) => ASSIGNMENT.test(t))) {
       for (const t of tokens) {
         const [, name, raw] = t.match(ASSIGNMENT);
-        const quoted = raw.match(/^(["'])(.*)\1$/s);
-        const expanded = quoted && quoted[1] === "'" ? quoted[2] : expandWord(quoted ? quoted[2] : raw, vars);
-        if (expanded === null) delete vars[name];
-        else vars[name] = expanded;
+        const expanded = expandWord(raw, vars);
+        // A value the hook can't work out stays unknown (`$NAME`), so a later use of it is unknown
+        // too, and `export GIT_WORK_TREE=$WT` still counts as pointing git somewhere unknown.
+        vars[name] = expanded === null ? `$${name}` : expanded;
       }
       continue;
     }
@@ -288,24 +584,39 @@ function checkBash(command, cwd, depth = 0) {
     while (tokens.length && (ASSIGNMENT.test(tokens[0]) || PASSTHROUGH_COMMANDS.has(tokens[0]))) {
       const wrapper = PASSTHROUGH_COMMANDS.has(tokens[0]);
       const prefix = tokens[0].match(ASSIGNMENT);
-      if (prefix && prefix[1] === "GIT_WORK_TREE") workTree = prefix[2].replace(/^(["'])(.*)\1$/s, "$2");
+      if (prefix && prefix[1] === "GIT_WORK_TREE") workTree = prefix[2];
+      const withValue = WRAPPER_OPTS_WITH_VALUE[tokens[0]];
+      const isTimeout = tokens[0] === "timeout";
       tokens = tokens.slice(1);
-      if (wrapper) while (tokens.length && tokens[0].startsWith("-")) tokens = tokens.slice(1);
+      if (!wrapper) continue;
+      while (tokens.length && tokens[0].startsWith("-")) tokens = tokens.slice(withValue?.has(tokens[0]) ? 2 : 1);
+      if (isTimeout) tokens = tokens.slice(1); // the duration
     }
     if (!tokens.length) continue;
     const cmd = basename(tokens[0]);
 
     if (cmd === "cd" || cmd === "pushd") {
       if (cmd === "pushd") dirStack.push(dir);
-      dir = tokens[1] ? resolvePath(tokens[1], dir, vars) : homedir();
+      const where = tokens.slice(1).find((t) => !/^-[LPe@]+$/.test(t));
+      const from = dir;
+      // `cd -` goes back to the previous folder, unknown when the command didn't set it.
+      dir = where === undefined ? homedir() : where === "-" ? previousDir : resolvePath(where, dir, vars);
+      previousDir = from;
       continue;
     }
     if (cmd === "popd") {
-      dir = dirStack.length ? dirStack.pop() : null;
+      // popd with an empty stack fails and leaves the directory as it was.
+      if (dirStack.length) dir = dirStack.pop();
       continue;
     }
-    if (SHELLS.has(cmd) && tokens[1] === "-c" && tokens[2] && depth < 2) {
-      const hit = dir ? checkBash(tokens[2], dir, depth + 1) : null;
+    if (SHELLS.has(cmd) && /^-[a-z]*c$/.test(tokens[1] ?? "") && tokens[2]) {
+      const hit = depth < MAX_DEPTH ? checkBash(tokens[2], dir, depth + 1, vars) : null;
+      if (hit) return hit;
+      continue;
+    }
+    // `eval "git commit ..."` runs its words as a command.
+    if (cmd === "eval" && tokens.length > 1) {
+      const hit = depth < MAX_DEPTH ? checkBash(tokens.slice(1).join(" "), dir, depth + 1, vars) : null;
       if (hit) return hit;
       continue;
     }
@@ -313,26 +624,36 @@ function checkBash(command, cwd, depth = 0) {
       const start = workTree === undefined ? dir : resolvePath(workTree, dir, vars);
       const { target, args } = parseGit(tokens, start, vars);
       const reason = unsafeGitReason(args);
-      if (!reason) continue;
-      const top = mainCheckoutContaining(target);
-      if (top) return { top, what: `\`${reason}\`` };
+      const hit = reason ? hitAt(target, `\`${reason}\``) : undefined;
+      if (hit) return hit;
       continue;
     }
     if (cmd === "gh" && ((tokens[1] === "pr" && tokens[2] === "checkout") || (tokens[1] === "repo" && tokens[2] === "sync"))) {
-      const top = mainCheckoutContaining(dir);
-      if (top) return { top, what: `\`gh ${tokens[1]} ${tokens[2]}\`` };
+      const hit = hitAt(dir, `\`gh ${tokens[1]} ${tokens[2]}\``);
+      if (hit) return hit;
       continue;
     }
     const release = releaseInvocation(tokens, dir, vars);
-    if (release) {
-      const top = mainCheckoutContaining(release.target);
-      if (top) return { top, what: `\`${release.what}\`` };
-    }
+    const hit = release ? hitAt(release.target, `\`${release.what}\``) : undefined;
+    if (hit) return hit;
   }
   return null;
 }
 
 function refuse(top, what) {
+  if (top === null) {
+    process.stderr.write(
+      [
+        `Blocked: ${what} in a folder named by a variable or by command output ($VAR, \${VAR}, $(...)).`,
+        "This guard reads the command before the shell fills those in, so it can't tell whether the",
+        "folder is a repo's MAIN checkout, where changes are never made.",
+        "Write the folder's path out in full instead (for example `git -C /full/path/to/worktree commit ...`",
+        "or `cd /full/path/to/worktree && ...`), and make changes only in a worktree.",
+        "Commands that only read can use variables.",
+      ].join("\n") + "\n",
+    );
+    process.exit(BLOCK_EXIT_CODE);
+  }
   const repo = basename(top);
   process.stderr.write(
     [
