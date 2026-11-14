@@ -363,6 +363,32 @@ class RepoRulesFirst(unittest.TestCase):
                 r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
                 self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
             os.remove(os.path.join(self.b, name))
+        # Words the shell expands into files there count too, unless written whole in single quotes: a glob, braces
+        # or backticks as the script word, and a glob that only looks like BSD's suffix before a later -e. GNU reads
+        # the empty suffix as the script and edits what these expand to.
+        write(os.path.join(self.b, "abc"), "a\n")
+        write(os.path.join(self.b, "ax"), "a\n")
+        for cmd in ("sed -n -i '' a*", "sed -n -i '' a{bc,x}", "sed -n -i '' a`echo x`", "sed -n -i '' ab?",
+                    "sed -n -i '' a[b]c", "sed -i .* -e 1d", "sed -i .{gitignore,x} -e 1d", "sed -n -i '' abc",
+                    f"sed -n -i '' {target} abc"):
+            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
+            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
+        # A path through a folder link: the OS follows the link before "..", so the word is checked as written.
+        os.makedirs(os.path.join(self.b, "sub", "deep"))
+        write(os.path.join(self.b, "sub", "p"), "a\n")
+        os.symlink(os.path.join("sub", "deep"), os.path.join(self.b, "app"))
+        os.symlink("missing", os.path.join(self.b, "q"))
+        os.makedirs(os.path.join(self.b, "h"))
+        for cmd in ("sed -n -i '' app/../p", f"sed -n -i '' {self.b}/app/../p", "sed -i '' q", "sed -i '' h"):
+            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
+            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
+        # Written whole in single quotes, the same scripts expand to nothing, so a file elsewhere can still be edited.
+        for cmd in (f"sed -i '' 'a*' {target}", f"sed -i '' 's/a.*/b/' {target}", f"sed -i '' 's/ *$//' {target}",
+                    f"sed -i '' '$d' {target}"):
+            self.assertIsNone(self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex), cmd)
+        # The same text unquoted anywhere in the command isn't literal.
+        r = self.run_hook(f"echo 'a*'; sed -n -i '' a* {target}", cwd=self.b, session=uuid.uuid4().hex)
+        self.assertTrue(r and r.startswith("MAIN CHECKOUT"), r)
         # A long s script with many escapes is read in linear time (the hook has 15 s, and a timeout lets the call
         # through).
         script = "s/" + "\\(\\[a\\]\\)\\." * 15 + "/x/g"

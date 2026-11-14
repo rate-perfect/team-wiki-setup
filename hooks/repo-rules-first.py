@@ -154,6 +154,7 @@ def candidate_paths(tool, ti, cwd):
     # The folders each simple command would write to (same reading as the main checkout guard).
     here = cwd
     budget = [MAX_IMPORTS_PER_COMMAND, MAX_SCRIPTS_PER_COMMAND]
+    literal = literal_words(cmd)
     for tokens in shell_segments(cmd):
         # `if cd x; then ...`, `{ cd x && ...; }`. The main checkout guard deliberately reads segments as main does,
         # so it doesn't see a build behind a shell keyword or a wrapper (`timeout`, `env`) at all.
@@ -163,7 +164,7 @@ def candidate_paths(tool, ti, cwd):
             if len(tokens) > 1 and "$" not in tokens[1]:
                 here = resolve(tokens[1], here)
             continue
-        found = segment_targets(tokens, here) + run_targets(tokens, here, budget)
+        found = segment_targets(tokens, here, literal=literal) + run_targets(tokens, here, budget)
         paths += [t for t in found if "$" not in t and not t.startswith(SCRATCH_PREFIXES)]
     return list(dict.fromkeys(paths))
 
@@ -408,13 +409,82 @@ def sed_safe_script(word):
     return all(re.fullmatch(_SED_SAFE_CMD, p) for p in pieces)
 
 
-def sed_files(args, here):
+SHELL_EXPANDS = re.compile(r"[`$]|\{|^~")
+GLOB_CHARS = "*?["
+
+
+def literal_words(cmd):
+    """Words written whole in single quotes ('s/a$//', 'a''b'), in which the shell expands nothing, less any word of
+    the same text written another way anywhere in the command. Read conservatively: an unclosed quote gives none."""
+    cmd = HEREDOC.sub("<<HEREDOC\n", cmd)
+    whole, other = set(), set()
+    word, quoted_only, started = [], True, False
+    i, n = 0, len(cmd)
+    while i <= n:
+        c = cmd[i] if i < n else " "
+        if c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                return set()
+            word.append(cmd[i + 1:j])
+            started, i = True, j + 1
+            continue
+        if c in " \t\n;&|()<>":
+            if started:
+                (whole if quoted_only else other).add("".join(word))
+            word, quoted_only, started = [], True, False
+            i += 1
+            continue
+        started, quoted_only = True, False
+        if c == "\\" and i + 1 < n:
+            word.append(cmd[i + 1])
+            i += 2
+            continue
+        if c == '"':
+            j = cmd.find('"', i + 1)
+            while j > 0 and cmd[j - 1] == "\\":
+                j = cmd.find('"', j + 1)
+            if j < 0:
+                return set()
+            word.append(cmd[i + 1:j])
+            i = j + 1
+            continue
+        word.append(c)
+        i += 1
+    return whole - other
+
+
+def sed_script_may_be_file(word, here, literal=frozenset()):
+    """Whether a word read as the sed script may still be a file sed edits. After an empty BSD suffix (''), GNU reads
+    '' as the script and this word as a file, so a safe-script word is dropped only when it can't name one: it isn't
+    an existing path, a glob matches nothing, and the shell won't expand it ($, backticks, braces, ~). The path is
+    joined without tidying `..`, because the OS follows symlinks first. A word in `literal` (written whole in single
+    quotes, `literal_words`) is expanded by nothing, so only the path itself is checked. Any doubt counts it."""
+    if not word:
+        return False
+    expands = word not in literal
+    if expands and SHELL_EXPANDS.search(word):
+        return True
+    raw = word if os.path.isabs(word) else os.path.join(here or "/", word)
+    try:
+        if expands and any(ch in word for ch in GLOB_CHARS):
+            if sum(1 for part in word.split(os.sep) if any(ch in part for ch in GLOB_CHARS)) > MAX_GLOB_SEGMENTS:
+                return True
+            return next(glob.iglob(raw.replace("[^", "[!")), None) is not None
+        return os.path.lexists(raw)
+    except (ValueError, OSError):
+        return True
+
+
+def sed_files(args, here, literal=frozenset()):
     """Where an in-place sed may write. As on main, every positional word counts as a path, whether or not it exists
     yet (the value of -f too: main counted the script file's path, and the file isn't read). Only two words are ever
-    dropped: BSD's backup suffix after a bare -i (empty or starting with ".", not an existing file, and before any
-    script), and the script itself, when it is a known-safe script (`sed_safe_script`). The script is the value of
-    -e, or else the first positional word after the suffix, and it is dropped only if it isn't also an existing path
-    (GNU reads it as a file after an empty suffix). A script that isn't known-safe counts the current folder,
+    dropped: BSD's backup suffix after a bare -i (empty, or starting with "." with nothing the shell expands, not an
+    existing file, and before any script), and the script itself, when it is a known-safe script
+    (`sed_safe_script`). The script is the value of -e, or else the first positional word after the suffix, and it
+    is dropped only if it can't name a file (`sed_script_may_be_file`: GNU reads it as one after an empty suffix).
+    The guard reads the command before any of it runs, so a file an earlier part of the same command creates isn't
+    seen. A script that isn't known-safe counts the current folder,
     as main's reading of it did. A word the shell will still expand (`$f`, `$(...)`, backticks, `{a,b}`, `~+`)
     counts both its literal path and the current folder; a glob counts what it matches, or its folder. Reading this
     wrongly can only add a refusal."""
@@ -449,7 +519,9 @@ def sed_files(args, here):
                 out.append(here)
             continue
         if (a == "-i" and suffix_at is None and not positional and not script_given and i + 1 < len(args)
-                and (args[i + 1] == "" or args[i + 1].startswith(".")) and not os.path.isfile(resolve(args[i + 1], here))):
+                and (args[i + 1] == "" or (args[i + 1].startswith(".") and not SHELL_EXPANDS.search(args[i + 1])
+                                           and not any(ch in args[i + 1] for ch in GLOB_CHARS)))
+                and not os.path.isfile(resolve(args[i + 1], here))):
             suffix_at = i + 1  # BSD's backup suffix; GNU reads it as the script, which is checked the same way
             continue
         if a.startswith("-") and a != "-":
@@ -459,10 +531,12 @@ def sed_files(args, here):
         positional.append(a)
     if not script_given and positional:
         script = positional.pop(0)
-        # A safe-script word that is also an existing path still counts: after BSD's suffix ('') GNU reads that
-        # word as a file (`sed -i '' p` rewrites ./p there).
-        if not sed_safe_script(script) or (script and os.path.lexists(resolve(script, here))):
+        if not sed_safe_script(script):
             out.append(resolve(script, here) if script else here)
+        elif sed_script_may_be_file(script, here, literal):
+            # GNU may read it as a file (`sed -i '' p`, `sed -i '' a*`): count it the way a file word is counted.
+            path = resolve(script, here)
+            out += [here, path] + (glob_targets(path, here) if any(ch in script for ch in GLOB_CHARS) else [])
     for a in positional:
         if not a:
             continue
@@ -500,9 +574,10 @@ def glob_targets(pattern, here):
         return [folder]
 
 
-def segment_targets(tokens, here, guard=False):
+def segment_targets(tokens, here, guard=False, literal=frozenset()):
     """Folders a single shell segment would change, or [] if it changes nothing. `guard`: read builds the way the
-    main checkout guard does (never more permissive than main); otherwise as the rules check does."""
+    main checkout guard does (never more permissive than main); otherwise as the rules check does. `literal`: the
+    command's words written whole in single quotes (`literal_words`)."""
     if not tokens:
         return []
     targets = []
@@ -538,7 +613,7 @@ def segment_targets(tokens, here, guard=False):
         return targets
     plain = [a for a in args if not a.startswith("-")]
     if cmd == "sed" and sed_in_place(args):
-        targets += sed_files(args, here)
+        targets += sed_files(args, here, literal)
     elif cmd in FILE_WRITERS:
         targets += [resolve(a, here) for a in plain] or [here]
     elif cmd in LAST_ARG_WRITERS and plain:
@@ -1002,12 +1077,13 @@ def main_checkout_violation(tool, ti, cwd):
         return None
     cmd = expand_vars(ti.get("command") or "")
     here = cwd
+    literal = literal_words(cmd)
     for tokens in shell_segments(cmd):
         if tokens and tokens[0] == "cd":
             if len(tokens) > 1 and "$" not in tokens[1]:
                 here = resolve(tokens[1], here)
             continue
-        for t in segment_targets(tokens, here, guard=True):
+        for t in segment_targets(tokens, here, guard=True, literal=literal):
             if "$" in t:
                 continue
             top = toplevel(t)
