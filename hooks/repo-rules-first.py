@@ -378,39 +378,28 @@ def resolve(path, here):
 
 def sed_in_place(args):
     """True if sed edits files in place: -i or -I, alone or in a short-flag group (`-Ei`, `-ni`), or GNU's
-    --in-place (with or without a suffix). Over-matching only adds a refusal."""
-    return any(a.startswith("--in-place") or re.match(r"^-[a-zA-Z]*[iI]", a) for a in args)
+    --in-place in any shortened form (`--in`, `--in-pl=.bak`). Over-matching only adds a refusal."""
+    for a in args:
+        name = a.split("=", 1)[0]
+        if re.match(r"^-[a-zA-Z]*[iI]", a) or (len(name) >= 3 and "--in-place".startswith(name)):
+            return True
+    return False
 
 
-def sed_script_option(arg):
-    """True for `--expression=...` or `--file=...`, or a GNU abbreviation of either (`--expr=`, `--fil=`)."""
-    name = arg.split("=", 1)[0] if arg.startswith("--") and "=" in arg else ""
-    return len(name) > 3 and ("--expression".startswith(name) or "--file".startswith(name))
-
-
-def sed_files(args):
-    """The files `sed -i` edits: its arguments after the script, leaving out the script itself (the first argument
-    unless -e/-f gave it) and the values of -e/-f (including GNU's abbreviations such as --expr=). BSD sed takes
-    its backup suffix as the word after a bare -i (`sed -i '' ...`, `sed -i .bak ...`); GNU takes it attached
-    (`-i.bak`) and reads that word as the script or a file. So the word is taken as BSD's suffix only while no
-    script has been seen and it is empty or starts with "." (a sed script never does). Once a script is known it's
-    a file (`sed -e x -i .env`): reading a suffix as a file only adds a refusal."""
-    files, script_given, skip = [], False, False
-    for i, a in enumerate(args):
-        if skip:
-            skip = False
-        elif (a == "-i" and i + 1 < len(args) and not script_given and not files
-              and (args[i + 1] == "" or args[i + 1].startswith("."))):
-            skip = True
-        elif a in ("-e", "--expression", "-f", "--file"):
-            script_given, skip = True, True
-        elif (sed_script_option(a) or (a.startswith(("-e", "-f")) and len(a) > 2)):
-            script_given = True
-        elif a.startswith("-") and a != "-":
+def sed_files(args, here):
+    """The files an in-place sed may edit: every word that names an existing file. sed can only edit files that
+    exist, and which word is the script, a backup suffix or a file depends on BSD or GNU sed and on the order of
+    the arguments. So nothing is guessed from position: the empty word (BSD's `-i ''`) is a folder and a script
+    like `s/a/b/` names no file, so neither counts. A script file (`-f script.sed`) that exists counts too, which
+    at worst adds a refusal."""
+    out = []
+    for a in args:
+        if not a or a.startswith("-"):
             continue
-        elif a:
-            files.append(a)
-    return files if script_given else files[1:]
+        path = resolve(a, here)
+        if os.path.isfile(path):
+            out.append(path)
+    return out
 
 
 def segment_targets(tokens, here, guard=False):
@@ -451,7 +440,7 @@ def segment_targets(tokens, here, guard=False):
         return targets
     plain = [a for a in args if not a.startswith("-")]
     if cmd == "sed" and sed_in_place(args):
-        targets += [resolve(a, here) for a in sed_files(args)]
+        targets += sed_files(args, here)
     elif cmd in FILE_WRITERS:
         targets += [resolve(a, here) for a in plain] or [here]
     elif cmd in LAST_ARG_WRITERS and plain:
