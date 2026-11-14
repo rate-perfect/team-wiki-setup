@@ -110,11 +110,13 @@ Optional settings for the repo rules hook:
   build behind `timeout`, `env` or a shell keyword (`if …; then`) isn't
   refused. Running its code with `npm test`,
   `npm start`, `npx` or a script only reads it, so that's allowed. An
-  in-place `sed` (`sed -i`) counts the files it edits, read the way your sed
-  reads it: macOS's own sed takes the word after `-i` as the backup suffix,
-  GNU sed takes it as the script. The hook assumes GNU unless it is sure
-  `sed` is macOS's; set `REPO_RULES_SED=bsd` or `gnu` to say which. Delete the
-  section to turn it off.
+  in-place `sed` (`sed -i`) is refused when a file it may edit is in a main
+  checkout. With macOS's own sed, `sed -i '' 's/a/b/' /other/file` run from a
+  main checkout edits only `/other/file`, so it is allowed when the script is
+  in single quotes and plain (no `w`, `r`, `e`, `a`, `i`, `c` or blocks) and
+  nothing else is unusual about the command. The hook assumes GNU sed unless
+  it is sure `sed` is macOS's; set `REPO_RULES_SED=bsd` or `gnu` to say which.
+  Delete the section to turn it off.
 
 After that, whenever you ask Claude for a report, doc, dashboard, or HTML tool,
 it also **mirrors a copy to the wiki and gives you the URL** — internal
