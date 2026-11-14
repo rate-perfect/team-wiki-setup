@@ -361,6 +361,16 @@ class RepoRulesFirst(unittest.TestCase):
         start = time.monotonic()
         self.run_hook(f"sed -i '' '{script}' CLAUDE.md", cwd=self.b, session=uuid.uuid4().hex)
         self.assertLess(time.monotonic() - start, 3, "a script with 60 escapes is checked quickly")
+        # From a folder that isn't a checkout, a brace or backtick path into the main checkout is still refused, and a
+        # script file full of blank lines doesn't slow the hook (it isn't read).
+        blanks = os.path.join(self.scratch, "s.sed")
+        write(blanks, "s/a/b/\n" + "   \n" * 300 + "p\n")
+        for cmd in (f"sed -i '' 's/a/b/' {self.b}/{{CLAUDE,README}}.md", f"sed -i '' 's/a/b/' {self.b}/CLAUDE.md{{,}}",
+                    f"sed -i '' 's/a/b/' \"{self.b}/`echo CLAUDE.md`\"", f"sed -i -f {blanks} {self.b}/CLAUDE.md"):
+            start = time.monotonic()
+            r = self.run_hook(cmd, cwd=self.scratch, session=uuid.uuid4().hex)
+            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
+            self.assertLess(time.monotonic() - start, 3, cmd)
         # A file in the main checkout itself is still refused, in BSD and GNU forms and any argument order: GNU
         # reads a "."-word after -i as a file once the script is known, an empty script empties a file with -n,
         # and -I, -Ei, -ni and --in-place (shortened too) edit in place.
@@ -386,7 +396,11 @@ class RepoRulesFirst(unittest.TestCase):
                     f"sed -i '' '1{{w CLAUDE.md\n}}' {target}", f"sed -i '' -e '1{{w CLAUDE.md' -e '}}' {target}",
                     f"sed -i '' '1!{{w CLAUDE.md\n}}' {target}", f"sed -i '' 's/a/b/ w CLAUDE.md' {target}",
                     f"sed -i '' 'p;wCLAUDE.md' {target}", "cd -P src && sed -i '' 's/a/b/' s.md",
-                    "sed -i '' 's/a/b/' {1..3}.md", "sed -i '' 's/a/b/' s.md x"):
+                    "sed -i '' 's/a/b/' {1..3}.md", "sed -i '' 's/a/b/' s.md x",
+                    f"sed -i '' 'sxaxbxw CLAUDE.md' {target}", f"sed -i '' 's a b w CLAUDE.md' {target}",
+                    f"sed -i '' '0~1w CLAUDE.md' {target}", f"sed -i '' '1,+2w CLAUDE.md' {target}",
+                    f"sed -i '' '\\%a%w CLAUDE.md' {target}", f"sed -i '' '1!!w CLAUDE.md' {target}",
+                    "curl -so new.md https://example.com && sed -n -i '' new.md"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
             self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
 
