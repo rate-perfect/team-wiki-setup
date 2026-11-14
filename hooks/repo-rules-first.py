@@ -376,20 +376,35 @@ def resolve(path, here):
     return os.path.normpath(path if os.path.isabs(path) else os.path.join(here or "/", path))
 
 
+def sed_in_place(args):
+    """True if sed edits files in place: -i or -I, alone or in a short-flag group (`-Ei`, `-ni`), or GNU's
+    --in-place (with or without a suffix). Over-matching only adds a refusal."""
+    return any(a.startswith("--in-place") or re.match(r"^-[a-zA-Z]*[iI]", a) for a in args)
+
+
+def sed_script_option(arg):
+    """True for `--expression=...` or `--file=...`, or a GNU abbreviation of either (`--expr=`, `--fil=`)."""
+    name = arg.split("=", 1)[0] if arg.startswith("--") and "=" in arg else ""
+    return len(name) > 3 and ("--expression".startswith(name) or "--file".startswith(name))
+
+
 def sed_files(args):
     """The files `sed -i` edits: its arguments after the script, leaving out the script itself (the first argument
-    unless -e/-f gave it), the values of -e/-f, and BSD sed's backup suffix after a bare -i (`sed -i '' ...`,
-    `sed -i .bak ...`). GNU sed takes the suffix attached (`-i.bak`), so a word after a bare -i is the script there:
-    a word that is empty or starts with "." can't be a sed script, so it's read as the suffix."""
+    unless -e/-f gave it) and the values of -e/-f (including GNU's abbreviations such as --expr=). BSD sed takes
+    its backup suffix as the word after a bare -i (`sed -i '' ...`, `sed -i .bak ...`); GNU takes it attached
+    (`-i.bak`) and reads that word as the script or a file. So the word is taken as BSD's suffix only while no
+    script has been seen and it is empty or starts with "." (a sed script never does). Once a script is known it's
+    a file (`sed -e x -i .env`): reading a suffix as a file only adds a refusal."""
     files, script_given, skip = [], False, False
     for i, a in enumerate(args):
         if skip:
             skip = False
-        elif a == "-i" and i + 1 < len(args) and (args[i + 1] == "" or args[i + 1].startswith(".")):
+        elif (a == "-i" and i + 1 < len(args) and not script_given and not files
+              and (args[i + 1] == "" or args[i + 1].startswith("."))):
             skip = True
         elif a in ("-e", "--expression", "-f", "--file"):
             script_given, skip = True, True
-        elif a.startswith("--expression=") or a.startswith("--file=") or (a.startswith(("-e", "-f")) and len(a) > 2):
+        elif (sed_script_option(a) or (a.startswith(("-e", "-f")) and len(a) > 2)):
             script_given = True
         elif a.startswith("-") and a != "-":
             continue
@@ -435,7 +450,7 @@ def segment_targets(tokens, here, guard=False):
             targets.append(where)
         return targets
     plain = [a for a in args if not a.startswith("-")]
-    if cmd == "sed" and any(a.startswith("-i") for a in args):
+    if cmd == "sed" and sed_in_place(args):
         targets += [resolve(a, here) for a in sed_files(args)]
     elif cmd in FILE_WRITERS:
         targets += [resolve(a, here) for a in plain] or [here]

@@ -352,8 +352,13 @@ class RepoRulesFirst(unittest.TestCase):
                     f"sed -i.bak -e 's/a/b/' -e 's/c/d/' {target}"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
             self.assertTrue(r is None or not r.startswith("MAIN CHECKOUT"), f"{cmd}: {r}")
-        # A file in the main checkout itself is still refused.
-        for cmd in ("sed -i '' 's/a/b/' CLAUDE.md", "sed -i 's/a/b/' CLAUDE.md", "sed -i -e 's/a/b/' CLAUDE.md"):
+        # A file in the main checkout itself is still refused, in BSD and GNU forms: GNU reads a "."-word after -i
+        # as a file once the script is known, and -I, -Ei, -ni and --in-place edit in place too.
+        for cmd in ("sed -i '' 's/a/b/' CLAUDE.md", "sed -i 's/a/b/' CLAUDE.md", "sed -i -e 's/a/b/' CLAUDE.md",
+                    "sed -e 's/a/b/' -i .env", "sed 's/a/b/' -i .env", "sed -f s.sed -i .gitignore",
+                    "sed -e 's/a/b/' -i ./CLAUDE.md", "sed -I '' 's/a/b/' CLAUDE.md", "sed -Ei '' 's/a/b/' CLAUDE.md",
+                    "sed -ni '' 's/a/b/p' CLAUDE.md", "sed --in-place 's/a/b/' CLAUDE.md",
+                    "sed --in-place=.bak 's/a/b/' CLAUDE.md", "sed -i --expr=s/a/b/ CLAUDE.md"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
             self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
 
