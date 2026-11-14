@@ -394,7 +394,7 @@ def sed_in_place(args):
 _SED_RE_ADDR = r"(?:\d+|\$|/(?:\\.|[^/\\\n])*/I?)"
 _SED_BODY = r"(?:\\.|(?!\1)[^\\\n])*"
 _SED_SAFE_CMD = (r"(?:" + _SED_RE_ADDR + r"(?:," + _SED_RE_ADDR + r")?)?!?"
-                 r"(?:s([/|#,:@])" + _SED_BODY + r"\1" + _SED_BODY + r"\1[gpiIm0-9]*"
+                 r"(?:s([/|#,:@])" + _SED_BODY + r"\1" + _SED_BODY + r"\1[gpiImM0-9]*"
                  r"|y([/|#,:@])" + _SED_BODY.replace(r"\1", r"\2") + r"\2" + _SED_BODY.replace(r"\1", r"\2") + r"\2"
                  r"|[dpqPDGHNghxnl=]"
                  r"|[aic]\\?[^;\n]*)")
@@ -413,7 +413,8 @@ def sed_files(args, here):
     yet (the value of -f too: main counted the script file's path, and the file isn't read). Only two words are ever
     dropped: BSD's backup suffix after a bare -i (empty or starting with ".", not an existing file, and before any
     script), and the script itself, when it is a known-safe script (`sed_safe_script`). The script is the value of
-    -e, or else the first positional word after the suffix. A script that isn't known-safe counts the current folder,
+    -e, or else the first positional word after the suffix, and it is dropped only if it isn't also an existing path
+    (GNU reads it as a file after an empty suffix). A script that isn't known-safe counts the current folder,
     as main's reading of it did. A word the shell will still expand (`$f`, `$(...)`, backticks, `{a,b}`, `~+`)
     counts both its literal path and the current folder; a glob counts what it matches, or its folder. Reading this
     wrongly can only add a refusal."""
@@ -458,7 +459,9 @@ def sed_files(args, here):
         positional.append(a)
     if not script_given and positional:
         script = positional.pop(0)
-        if not sed_safe_script(script):
+        # A safe-script word that is also an existing path still counts: after BSD's suffix ('') GNU reads that
+        # word as a file (`sed -i '' p` rewrites ./p there).
+        if not sed_safe_script(script) or (script and os.path.lexists(resolve(script, here))):
             out.append(resolve(script, here) if script else here)
     for a in positional:
         if not a:

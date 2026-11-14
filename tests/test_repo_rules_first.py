@@ -352,9 +352,17 @@ class RepoRulesFirst(unittest.TestCase):
                     f"sed -i.bak -e 's/a/b/' -e 's/c/d/' {target}", f"sed -i '' 's/a.*/b/' {target}",
                     f"sed -i '' 's/[0-9]//' {target}", f"sed -i '' -E 's/a?/b/' {target}", f"sed -i '' '1d' {target}",
                     f"sed -i '' '/^#/d' {target}", f"sed -i '' 's|a|b|g' {target}", f"sed -i '' '$d' {target}",
-                    f"sed -i '' 's/a$//' {target}"):
+                    f"sed -i '' 's/a$//' {target}", f"sed -i '' 's/a/b/M' {target}"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
-            self.assertTrue(r is None or not r.startswith("MAIN CHECKOUT"), f"{cmd}: {r}")
+            self.assertIsNone(r, cmd)
+        # A safe-script word that is also a file in the main checkout still counts: after an empty suffix, GNU reads
+        # it as the file to edit (`sed -i '' p` rewrites ./p).
+        for name in ("p", "d", "="):
+            write(os.path.join(self.b, name), "a\n")
+            for cmd in (f"sed -i '' {name}", f"sed -i '' {name} {target}"):
+                r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
+                self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
+            os.remove(os.path.join(self.b, name))
         # A long s script with many escapes is read in linear time (the hook has 15 s, and a timeout lets the call
         # through).
         script = "s/" + "\\(\\[a\\]\\)\\." * 15 + "/x/g"
