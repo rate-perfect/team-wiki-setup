@@ -386,6 +386,15 @@ class RepoRulesFirst(unittest.TestCase):
         for cmd in (f"sed -i '' 'a*' {target}", f"sed -i '' 's/a.*/b/' {target}", f"sed -i '' 's/ *$//' {target}",
                     f"sed -i '' '$d' {target}"):
             self.assertIsNone(self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex), cmd)
+        # Where the hook may read the command wrongly, nothing is dropped: `#` inside a word (shlex reads a comment),
+        # zsh glob qualifiers like d(N) (shlex splits at "("), and backslashes in double quotes.
+        write(os.path.join(self.b, "README.md"), "a\n")
+        for cmd in ("sed -n -i '' q#x README.md", "echo 'a*'; sed -n -i '' a*#x README.md", "sed -n -i '' 'q'#x README.md",
+                    "sed -n -i '' d(N) README.md", f"echo \"\\\\\" ; sed -n -i '' a* {target} ; echo '\"\\' 'a*'",
+                    "echo \"'\"; sed -n -i '' q#x README.md; echo \"'\"",
+                    f"echo \"\\\"\" ; sed -n -i '' a* {target} ; echo '\"' 'a*'"):
+            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
+            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
         # The same text unquoted anywhere in the command isn't literal.
         r = self.run_hook(f"echo 'a*'; sed -n -i '' a* {target}", cwd=self.b, session=uuid.uuid4().hex)
         self.assertTrue(r and r.startswith("MAIN CHECKOUT"), r)

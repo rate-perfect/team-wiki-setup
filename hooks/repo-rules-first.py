@@ -415,7 +415,10 @@ GLOB_CHARS = "*?["
 
 def literal_words(cmd):
     """Words written whole in single quotes ('s/a$//', 'a''b'), in which the shell expands nothing, less any word of
-    the same text written another way anywhere in the command. Read conservatively: an unclosed quote gives none."""
+    the same text written another way anywhere in the command. None when the hook may read the command wrongly: a
+    `#`, "(", ")" or backslash outside single quotes (shlex reads `#` inside a word as a comment and splits zsh glob
+    qualifiers like `d(N)` at "("), a backslash in double quotes, or an unclosed quote. sed's reading then drops no
+    word at all."""
     cmd = HEREDOC.sub("<<HEREDOC\n", cmd)
     whole, other = set(), set()
     word, quoted_only, started = [], True, False
@@ -425,27 +428,25 @@ def literal_words(cmd):
         if c == "'":
             j = cmd.find("'", i + 1)
             if j < 0:
-                return set()
+                return None
             word.append(cmd[i + 1:j])
             started, i = True, j + 1
             continue
-        if c in " \t\n;&|()<>":
+        if c in "#()\\":
+            return None
+        if c in " \t\n;&|<>":
             if started:
                 (whole if quoted_only else other).add("".join(word))
             word, quoted_only, started = [], True, False
             i += 1
             continue
         started, quoted_only = True, False
-        if c == "\\" and i + 1 < n:
-            word.append(cmd[i + 1])
-            i += 2
-            continue
         if c == '"':
             j = cmd.find('"', i + 1)
-            while j > 0 and cmd[j - 1] == "\\":
-                j = cmd.find('"', j + 1)
-            if j < 0:
-                return set()
+            # A backslash in double quotes can escape a quote; rather than follow it, give up (a second safeguard:
+            # the scan also fails safe on the unbalanced quotes a misread leaves).
+            if j < 0 or "\\" in cmd[i + 1:j]:
+                return None
             word.append(cmd[i + 1:j])
             i = j + 1
             continue
@@ -477,6 +478,9 @@ def sed_script_may_be_file(word, here, literal=frozenset()):
 
 
 def sed_files(args, here, literal=frozenset()):
+    if literal is None:
+        # The command may be read wrongly (literal_words): drop nothing, and count the folder and every word.
+        return [here] + [resolve(a, here) for a in args if a and not a.startswith("-")]
     """Where an in-place sed may write. As on main, every positional word counts as a path, whether or not it exists
     yet (the value of -f too: main counted the script file's path, and the file isn't read). Only two words are ever
     dropped: BSD's backup suffix after a bare -i (empty, or starting with "." with nothing the shell expands, not an
