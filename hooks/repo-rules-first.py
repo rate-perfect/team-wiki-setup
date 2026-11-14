@@ -26,6 +26,9 @@ checkout and quotes the section back. Remove the section to turn it off again.
 REPO_RULES_CLONE_ROOTS (optional, colon-separated folders) says where your local clones live. It is used only to
 find the repo named in a PR command (gh pr create --repo ..., az repos pr create ...) run from outside that repo.
 
+REPO_RULES_SED (optional, "bsd" or "gnu") says which sed `sed` is, for reading `sed -i` (sed_flavour). Without it,
+the guard reads sed as GNU unless it is sure sed is macOS's own.
+
 Distributed by https://github.com/rate-perfect/team-wiki-setup (install.sh). Change it there, not in ~/.claude/hooks.
 """
 import glob
@@ -34,6 +37,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -411,6 +415,41 @@ def sed_safe_script(word):
 
 SHELL_EXPANDS = re.compile(r"[`$]|\{|^~")
 GLOB_CHARS = "*?["
+MAX_GLOB_SEGMENTS = 3
+MAX_GLOB_MATCHES = 50
+# BSD sed's flags that take no value, so `-Ei ''` gives -i its suffix like `-i ''` does.
+BSD_SED_GROUP_I = re.compile(r"-[Ealnrsu]*i")
+# Where GNU sed is installed so that a shell profile may put it before /usr/bin/sed.
+GNU_SED_PLACES = ("/opt/homebrew/opt/gnu-sed", "/usr/local/opt/gnu-sed", "/opt/local/libexec/gnubin/sed",
+                  "~/.nix-profile/bin/sed", "/run/current-system/sw/bin/sed")
+
+
+def sed_flavour():
+    """"bsd" only when sure that `sed` is macOS's own: macOS, `sed` on PATH is /usr/bin/sed, no gnubin folder on
+    PATH, and no GNU sed installed where a shell profile could put it first (the shell Claude Code runs may have a
+    different PATH from this hook). Otherwise "gnu", which reads sed as main did. REPO_RULES_SED overrides it."""
+    forced = os.environ.get("REPO_RULES_SED", "")
+    if forced in ("bsd", "gnu"):
+        return forced
+    if sys.platform != "darwin":
+        return "gnu"
+    found = shutil.which("sed")
+    if not found or os.path.realpath(found) != "/usr/bin/sed":
+        return "gnu"
+    if any("gnubin" in d or "gnu-sed" in d for d in os.environ.get("PATH", "").split(os.pathsep)):
+        return "gnu"
+    if any(os.path.exists(os.path.expanduser(p)) for p in GNU_SED_PLACES):
+        return "gnu"
+    return "bsd"
+
+
+def sed_safe_script(word):
+    """True if the word is a sed script made only of known-safe commands, separated by ; or newlines."""
+    pieces = [p.strip(" \t") for p in re.split(r"[;\n]", word)]
+    pieces = [p for p in pieces if p]
+    if not pieces:
+        return False
+    return all(re.fullmatch(_SED_SAFE_CMD, p) for p in pieces)
 
 
 def literal_words(cmd):
@@ -421,7 +460,7 @@ def literal_words(cmd):
     word at all."""
     cmd = HEREDOC.sub("<<HEREDOC\n", cmd)
     whole, other = set(), set()
-    word, quoted_only, started = [], True, False
+    word, quoted_only, started, had_quote = [], True, False, False
     i, n = 0, len(cmd)
     while i <= n:
         c = cmd[i] if i < n else " "
@@ -430,14 +469,18 @@ def literal_words(cmd):
             if j < 0:
                 return None
             word.append(cmd[i + 1:j])
-            started, i = True, j + 1
+            started, had_quote, i = True, True, j + 1
             continue
         if c in "#()\\":
+            return None
+        if c in "<>" and started and not (not had_quote and "".join(word).isdigit()):
+            # `'h'2>x` and zsh's numeric globs (`x<->`, `<1-9>d`) are one word to the shell, not a word and a
+            # redirect. Only a plain fd number (`2>`) may come right before a redirect.
             return None
         if c in " \t\n;&|<>":
             if started:
                 (whole if quoted_only else other).add("".join(word))
-            word, quoted_only, started = [], True, False
+            word, quoted_only, started, had_quote = [], True, False, False
             i += 1
             continue
         started, quoted_only = True, False
@@ -448,6 +491,7 @@ def literal_words(cmd):
             if j < 0 or "\\" in cmd[i + 1:j]:
                 return None
             word.append(cmd[i + 1:j])
+            had_quote = True
             i = j + 1
             continue
         word.append(c)
@@ -455,109 +499,119 @@ def literal_words(cmd):
     return whole - other
 
 
-def sed_script_may_be_file(word, here, literal=frozenset()):
-    """Whether a word read as the sed script may still be a file sed edits. After an empty BSD suffix (''), GNU reads
-    '' as the script and this word as a file, so a safe-script word is dropped only when it can't name one: it isn't
-    an existing path, a glob matches nothing, and the shell won't expand it ($, backticks, braces, ~). The path is
-    joined without tidying `..`, because the OS follows symlinks first. A word in `literal` (written whole in single
-    quotes, `literal_words`) is expanded by nothing, so only the path itself is checked. Any doubt counts it."""
-    if not word:
-        return False
-    expands = word not in literal
-    if expands and SHELL_EXPANDS.search(word):
-        return True
-    raw = word if os.path.isabs(word) else os.path.join(here or "/", word)
-    try:
-        if expands and any(ch in word for ch in GLOB_CHARS):
-            if sum(1 for part in word.split(os.sep) if any(ch in part for ch in GLOB_CHARS)) > MAX_GLOB_SEGMENTS:
-                return True
-            return next(glob.iglob(raw.replace("[^", "[!")), None) is not None
-        return os.path.lexists(raw)
-    except (ValueError, OSError):
-        return True
+def expands(word, literal):
+    """Whether the shell may turn the word into something else, or into several words."""
+    return word not in literal and (bool(SHELL_EXPANDS.search(word)) or any(ch in word for ch in GLOB_CHARS))
 
 
-def sed_files(args, here, literal=frozenset()):
+def word_targets(word, here, literal):
+    """Where a file word may point: its path; a glob also what it matches (or its folder); a word the shell expands
+    otherwise ($, backticks, braces, ~) also the current folder."""
+    path = resolve(word, here)
+    if word in literal:
+        return [path]
+    if re.search(r"[`$]|\{|^~[+-]", word):
+        return [here, path]
+    if any(ch in word for ch in GLOB_CHARS):
+        return glob_targets(path, here)
+    return [path]
+
+
+def sed_long_option(a):
+    """("expression" | "file", value or None) for GNU's --expression/--file in any unambiguous short form
+    (--e, --expr=..., --fi), else None."""
+    if not a.startswith("--") or len(a) < 3:
+        return None
+    name, eq, value = a[2:].partition("=")
+    for full, shortest in (("expression", 1), ("file", 2)):
+        if len(name) >= shortest and full.startswith(name):
+            return full, (value if eq else None)
+    return None
+
+
+def sed_files(args, here, literal=frozenset(), flavour=None):
+    """Where an in-place sed may write. Every positional word counts as a path (the value of -f too), the way main
+    counted them, with globs and shell expansions followed (`word_targets`). Only these are ever dropped:
+
+    - The script, when it is a known-safe script (`sed_safe_script`) the shell can't change (`expands`). It is the
+      value of -e, or else the first positional word after any suffix: both seds read that word as the script, and
+      main dropped it too. With -e or -f given, every positional word is a file.
+    - Under BSD sed only (`sed_flavour`): the word after a bare -i (or -Ei, -ni, ...), which BSD always reads as the
+      backup suffix, when it has no "/" and the shell can't change it: the backup then sits next to the file. GNU
+      has no separate suffix: there that word is the script, as above.
+
+    Under BSD the script word is never a file, so no file or folder is looked at. When the command may be read
+    wrongly (`literal_words` gave None), nothing is dropped and the current folder counts too. A script that isn't
+    known-safe, or that the shell may change, counts the current folder. Reading this wrongly can only add a
+    refusal."""
     if literal is None:
-        # The command may be read wrongly (literal_words): drop nothing, and count the folder and every word.
         return [here] + [resolve(a, here) for a in args if a and not a.startswith("-")]
-    """Where an in-place sed may write. As on main, every positional word counts as a path, whether or not it exists
-    yet (the value of -f too: main counted the script file's path, and the file isn't read). Only two words are ever
-    dropped: BSD's backup suffix after a bare -i (empty, or starting with "." with nothing the shell expands, not an
-    existing file, and before any script), and the script itself, when it is a known-safe script
-    (`sed_safe_script`). The script is the value of -e, or else the first positional word after the suffix, and it
-    is dropped only if it can't name a file (`sed_script_may_be_file`: GNU reads it as one after an empty suffix).
-    The guard reads the command before any of it runs, so a file an earlier part of the same command creates isn't
-    seen. A script that isn't known-safe counts the current folder,
-    as main's reading of it did. A word the shell will still expand (`$f`, `$(...)`, backticks, `{a,b}`, `~+`)
-    counts both its literal path and the current folder; a glob counts what it matches, or its folder. Reading this
-    wrongly can only add a refusal."""
+    bsd = (flavour or sed_flavour()) == "bsd"
     out, positional, script_given, skip, flag = [], [], False, False, None
     suffix_at = None
+
+    def script_value(value):
+        nonlocal script_given
+        script_given = True
+        if not sed_safe_script(value) or expands(value, literal):
+            out.append(here)
+            if value not in literal and any(ch in value for ch in GLOB_CHARS):
+                out.extend(glob_targets(resolve(value, here), here))
+
     for i, a in enumerate(args):
         if skip:
             skip = False
-            if flag in ("-e", "--expression") and not sed_safe_script(a):
-                out.append(here)
-            elif flag in ("-f", "--file"):
-                out.append(resolve(a, here))
+            if flag == "expression":
+                script_value(a)
+            else:
+                script_given = True
+                out.extend(word_targets(a, here, literal))
             continue
-        if a in ("-e", "--expression", "-f", "--file"):
-            script_given, skip, flag = True, True, a
+        long = sed_long_option(a)
+        if long:
+            kind, value = long
+            if value is None:
+                skip, flag = True, kind
+            elif kind == "expression":
+                script_value(value)
+            else:
+                script_given = True
+                out.extend(word_targets(value, here, literal))
+            continue
+        if a in ("-e", "-f"):
+            skip, flag = True, "expression" if a == "-e" else "file"
             continue
         if a.startswith("-e") and len(a) > 2:
-            script_given = True
-            if not sed_safe_script(a[2:]):
-                out.append(here)
+            script_value(a[2:])
             continue
         if a.startswith("-f") and len(a) > 2:
             script_given = True
-            out.append(resolve(a[2:], here))
+            out.extend(word_targets(a[2:], here, literal))
             continue
-        if a.startswith(("--expression=", "--file=")):
-            script_given = True
-            value = a.split("=", 1)[1]
-            if a.startswith("--file="):
-                out.append(resolve(value, here))
-            elif not sed_safe_script(value):
+        if bsd and BSD_SED_GROUP_I.fullmatch(a) and suffix_at is None and not positional and i + 1 < len(args):
+            # BSD reads the next word as the backup suffix, whatever it is (`-i -e` gives the suffix "-e"). A backup
+            # is written at file + suffix, next to the file, unless the suffix has a "/"; that one, or one the shell
+            # may change, counts like a path.
+            suffix_at = i + 1
+            word = args[i + 1]
+            if "/" in word or expands(word, literal):
                 out.append(here)
-            continue
-        if (a == "-i" and suffix_at is None and not positional and not script_given and i + 1 < len(args)
-                and (args[i + 1] == "" or (args[i + 1].startswith(".") and not SHELL_EXPANDS.search(args[i + 1])
-                                           and not any(ch in args[i + 1] for ch in GLOB_CHARS)))
-                and not os.path.isfile(resolve(args[i + 1], here))):
-            suffix_at = i + 1  # BSD's backup suffix; GNU reads it as the script, which is checked the same way
+                out.extend(word_targets(word, here, literal))
             continue
         if a.startswith("-") and a != "-":
             continue
         if i == suffix_at:
-            continue  # BSD's suffix; under GNU an empty or "."-word here is a no-op or invalid script
+            continue
         positional.append(a)
     if not script_given and positional:
         script = positional.pop(0)
-        if not sed_safe_script(script):
-            out.append(resolve(script, here) if script else here)
-        elif sed_script_may_be_file(script, here, literal):
-            # GNU may read it as a file (`sed -i '' p`, `sed -i '' a*`): count it the way a file word is counted.
-            path = resolve(script, here)
-            out += [here, path] + (glob_targets(path, here) if any(ch in script for ch in GLOB_CHARS) else [])
+        if not sed_safe_script(script) or expands(script, literal):
+            out.append(here)
+            out.extend(word_targets(script, here, literal))
     for a in positional:
-        if not a:
-            continue
-        path = resolve(a, here)
-        if re.search(r"[`$]|\{|^~[+-]", a):
-            out += [here, path]
-        elif any(ch in a for ch in "*?["):
-            out += glob_targets(path, here)
-        else:
-            out.append(path)
+        if a:
+            out.extend(word_targets(a, here, literal))
     return out
-
-
-MAX_GLOB_SEGMENTS = 3
-
-
-MAX_GLOB_MATCHES = 50
 
 
 def glob_targets(pattern, here):

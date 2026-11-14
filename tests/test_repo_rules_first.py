@@ -8,6 +8,7 @@ CLAUDE.md it reads are the test's own.
 The repos sit next to this file, not under /tmp: the hook ignores scratch folders (/tmp, /var/folders) on purpose.
 A loose script outside any repo does go under /tmp, as a real scratch script would.
 """
+import importlib.util
 import json
 import os
 import re
@@ -342,84 +343,52 @@ class RepoRulesFirst(unittest.TestCase):
         for cmd in ("make -C ../repo-c -C $SUB", "npm --prefix ../repo-c --prefix \"$D\" test"):
             self.assert_paused_for(self.run_hook(cmd), c, cmd)
 
+    def sed_refused(self, cmd, cwd=None):
+        r = self.run_hook(cmd, cwd=cwd or self.b, session=uuid.uuid4().hex)
+        self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"),
+                        f"{os.environ.get('REPO_RULES_SED')}: {cmd}: {r}")
+
+    def sed_allowed(self, cmd):
+        self.assertIsNone(self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex),
+                          f"{os.environ.get('REPO_RULES_SED')}: {cmd}")
+
+    def test_sed_flavour_is_bsd_only_when_sure(self):
+        spec = importlib.util.spec_from_file_location("rrf_flavour", HOOK)
+        hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hook)
+        saved = {k: os.environ.get(k) for k in ("REPO_RULES_SED", "PATH")}
+        try:
+            for forced in ("bsd", "gnu"):
+                os.environ["REPO_RULES_SED"] = forced
+                self.assertEqual(hook.sed_flavour(), forced)
+            os.environ.pop("REPO_RULES_SED")
+            os.environ["PATH"] = os.pathsep.join(["/opt/x/libexec/gnubin", saved["PATH"] or ""])
+            self.assertEqual(hook.sed_flavour(), "gnu", "a gnubin folder on PATH means GNU")
+            os.environ["PATH"] = saved["PATH"] or ""
+            if sys.platform != "darwin":
+                self.assertEqual(hook.sed_flavour(), "gnu", "only macOS has BSD sed as sed")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
     def test_sed_in_place_counts_only_the_files_it_edits(self):
         # From a main checkout, editing a file elsewhere with sed -i isn't a change to the main checkout: the empty
-        # BSD backup suffix and the script aren't files.
+        # BSD backup suffix and the script aren't files. Each case runs as BSD sed and as GNU sed reads it.
         write(os.path.join(self.home, ".claude", "CLAUDE.md"), "# Never change a main checkout\nWork in a worktree.\n")
         target = os.path.join(self.scratch, "notes.txt")
         write(target, "a\n")
-        for cmd in (f"sed -i '' 's/a/b/' {target}", f"sed -i .bak 's/a/b/' {target}", f"sed -i -e 's/a/b/' {target}",
-                    f"sed -i.bak -e 's/a/b/' -e 's/c/d/' {target}", f"sed -i '' 's/a.*/b/' {target}",
-                    f"sed -i '' 's/[0-9]//' {target}", f"sed -i '' -E 's/a?/b/' {target}", f"sed -i '' '1d' {target}",
-                    f"sed -i '' '/^#/d' {target}", f"sed -i '' 's|a|b|g' {target}", f"sed -i '' '$d' {target}",
-                    f"sed -i '' 's/a$//' {target}", f"sed -i '' 's/a/b/M' {target}"):
-            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
-            self.assertIsNone(r, cmd)
-        # A safe-script word that is also a file in the main checkout still counts: after an empty suffix, GNU reads
-        # it as the file to edit (`sed -i '' p` rewrites ./p).
-        for name in ("p", "d", "="):
+        for name in ("abc", "ax", "README.md", ".env", ".gitignore", "sub/p"):
             write(os.path.join(self.b, name), "a\n")
-            for cmd in (f"sed -i '' {name}", f"sed -i '' {name} {target}"):
-                r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
-                self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
-            os.remove(os.path.join(self.b, name))
-        # Words the shell expands into files there count too, unless written whole in single quotes: a glob, braces
-        # or backticks as the script word, and a glob that only looks like BSD's suffix before a later -e. GNU reads
-        # the empty suffix as the script and edits what these expand to.
-        write(os.path.join(self.b, "abc"), "a\n")
-        write(os.path.join(self.b, "ax"), "a\n")
-        for cmd in ("sed -n -i '' a*", "sed -n -i '' a{bc,x}", "sed -n -i '' a`echo x`", "sed -n -i '' ab?",
-                    "sed -n -i '' a[b]c", "sed -i .* -e 1d", "sed -i .{gitignore,x} -e 1d", "sed -n -i '' abc",
-                    f"sed -n -i '' {target} abc"):
-            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
-            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
-        # A path through a folder link: the OS follows the link before "..", so the word is checked as written.
         os.makedirs(os.path.join(self.b, "sub", "deep"))
-        write(os.path.join(self.b, "sub", "p"), "a\n")
         os.symlink(os.path.join("sub", "deep"), os.path.join(self.b, "app"))
         os.symlink("missing", os.path.join(self.b, "q"))
         os.makedirs(os.path.join(self.b, "h"))
-        for cmd in ("sed -n -i '' app/../p", f"sed -n -i '' {self.b}/app/../p", "sed -i '' q", "sed -i '' h"):
-            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
-            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
-        # Written whole in single quotes, the same scripts expand to nothing, so a file elsewhere can still be edited.
-        for cmd in (f"sed -i '' 'a*' {target}", f"sed -i '' 's/a.*/b/' {target}", f"sed -i '' 's/ *$//' {target}",
-                    f"sed -i '' '$d' {target}"):
-            self.assertIsNone(self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex), cmd)
-        # Where the hook may read the command wrongly, nothing is dropped: `#` inside a word (shlex reads a comment),
-        # zsh glob qualifiers like d(N) (shlex splits at "("), and backslashes in double quotes.
-        write(os.path.join(self.b, "README.md"), "a\n")
-        for cmd in ("sed -n -i '' q#x README.md", "echo 'a*'; sed -n -i '' a*#x README.md", "sed -n -i '' 'q'#x README.md",
-                    "sed -n -i '' d(N) README.md", f"echo \"\\\\\" ; sed -n -i '' a* {target} ; echo '\"\\' 'a*'",
-                    "echo \"'\"; sed -n -i '' q#x README.md; echo \"'\"",
-                    f"echo \"\\\"\" ; sed -n -i '' a* {target} ; echo '\"' 'a*'"):
-            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
-            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
-        # The same text unquoted anywhere in the command isn't literal.
-        r = self.run_hook(f"echo 'a*'; sed -n -i '' a* {target}", cwd=self.b, session=uuid.uuid4().hex)
-        self.assertTrue(r and r.startswith("MAIN CHECKOUT"), r)
-        # A long s script with many escapes is read in linear time (the hook has 15 s, and a timeout lets the call
-        # through).
-        script = "s/" + "\\(\\[a\\]\\)\\." * 15 + "/x/g"
-        start = time.monotonic()
-        self.run_hook(f"sed -i '' '{script}' CLAUDE.md", cwd=self.b, session=uuid.uuid4().hex)
-        self.assertLess(time.monotonic() - start, 3, "a script with 60 escapes is checked quickly")
-        # From a folder that isn't a checkout, a brace or backtick path into the main checkout is still refused, and a
-        # script file full of blank lines doesn't slow the hook (it isn't read).
         blanks = os.path.join(self.scratch, "s.sed")
         write(blanks, "s/a/b/\n" + "   \n" * 300 + "p\n")
-        for cmd in (f"sed -i '' 's/a/b/' {self.b}/{{CLAUDE,README}}.md", f"sed -i '' 's/a/b/' {self.b}/CLAUDE.md{{,}}",
-                    f"sed -i '' 's/a/b/' \"{self.b}/`echo CLAUDE.md`\"", f"sed -i -f {blanks} {self.b}/CLAUDE.md"):
-            start = time.monotonic()
-            r = self.run_hook(cmd, cwd=self.scratch, session=uuid.uuid4().hex)
-            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
-            self.assertLess(time.monotonic() - start, 3, cmd)
-        # A file in the main checkout itself is still refused, in BSD and GNU forms and any argument order: GNU
-        # reads a "."-word after -i as a file once the script is known, an empty script empties a file with -n,
-        # and -I, -Ei, -ni and --in-place (shortened too) edit in place.
-        write(os.path.join(self.b, ".env"), "a\n")
-        write(os.path.join(self.b, ".gitignore"), "a\n")
-        for cmd in ("sed -i '' 's/a/b/' CLAUDE.md", "sed -i 's/a/b/' CLAUDE.md", "sed -i -e 's/a/b/' CLAUDE.md",
+        big = ("sed -i '' 's/a/b/' CLAUDE.md", "sed -i 's/a/b/' CLAUDE.md", "sed -i -e 's/a/b/' CLAUDE.md",
                     "sed -e 's/a/b/' -i .env", "sed 's/a/b/' -i .env", "sed -f s.sed -i .gitignore",
                     "sed -e 's/a/b/' -i ./CLAUDE.md", "sed -I '' 's/a/b/' CLAUDE.md", "sed -Ei '' 's/a/b/' CLAUDE.md",
                     "sed -ni '' 's/a/b/p' CLAUDE.md", "sed --in-place 's/a/b/' CLAUDE.md",
@@ -443,9 +412,88 @@ class RepoRulesFirst(unittest.TestCase):
                     f"sed -i '' 'sxaxbxw CLAUDE.md' {target}", f"sed -i '' 's a b w CLAUDE.md' {target}",
                     f"sed -i '' '0~1w CLAUDE.md' {target}", f"sed -i '' '1,+2w CLAUDE.md' {target}",
                     f"sed -i '' '\\%a%w CLAUDE.md' {target}", f"sed -i '' '1!!w CLAUDE.md' {target}",
-                    "curl -so new.md https://example.com && sed -n -i '' new.md"):
-            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
-            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
+                    "curl -so new.md https://example.com && sed -n -i '' new.md")
+        saved = os.environ.get("REPO_RULES_SED")
+        try:
+            for flavour in ("bsd", "gnu"):
+                os.environ["REPO_RULES_SED"] = flavour
+                self.check_sed_flavour(flavour, target, blanks, big)
+        finally:
+            if saved is None:
+                os.environ.pop("REPO_RULES_SED", None)
+            else:
+                os.environ["REPO_RULES_SED"] = saved
+
+    def check_sed_flavour(self, flavour, target, blanks, big):
+        if flavour == "bsd":
+            # BSD reads the word after a bare -i (or -Ei, -ni) as the suffix and the next as the script, never as
+            # a file, so even a script named like a file there is fine.
+            write(os.path.join(self.b, "p"), "a\n")
+            allowed = [f"sed -i '' 's/a/b/' {target}", f"sed -i .bak 's/a/b/' {target}",
+                       f"sed -i -e 's/a/b/' {target}", f"sed -i '' 's/a.*/b/' {target}",
+                       f"sed -i '' 's/[0-9]//' {target}", f"sed -i '' -E 's/a?/b/' {target}",
+                       f"sed -i '' '1d' {target}", f"sed -i '' '/^#/d' {target}", f"sed -i '' 's|a|b|g' {target}",
+                       f"sed -i '' '$d' {target}", f"sed -i '' 's/a$//' {target}", f"sed -i '' 's/a/b/M' {target}",
+                       f"sed -i '' 'a*' {target}", f"sed -i '' 's/ *$//' {target}",
+                       f"sed -i '' 's/a/b/' {target} 2>/dev/null", f"sed -i '' p {target}", "sed -i '' p",
+                       f"sed -Ei '' 's/a/b/' {target}", f"sed -ni '' 's/a/b/p' {target}"]
+        else:
+            # GNU reads -i's next word as the script.
+            allowed = [f"sed -i 's/a/b/' {target}", f"sed -i -e 's/a/b/' {target}", f"sed -i -E 's/a?/b/' {target}",
+                       f"sed -i 's/a.*/b/' {target}", f"sed -i '$d' {target}", f"sed -i 's/ *$//' {target}",
+                       f"sed -i 'a*' {target}", f"sed -i -n 's/a/b/p' {target}", f"sed -i '1d' {target} 2>/dev/null"]
+        allowed += [f"sed -i.bak -e 's/a/b/' -e 's/c/d/' {target}", f"sed -i.bak 's/a/b/' {target}"]
+        for cmd in allowed:
+            self.sed_allowed(cmd)
+        refused = [
+            # The shell turns these into several words, or into files there: a glob, braces or backticks as the
+            # script word or the -e value, a glob that looks like BSD's suffix before -e.
+            "sed -n -i '' a*", "sed -n -i '' a{bc,x}", "sed -n -i '' a`echo x`", "sed -n -i '' ab?",
+            "sed -n -i '' a[b]c", "sed -i .* -e 1d", "sed -i .{gitignore,x} -e 1d", f"sed -n -i '' {target} abc",
+            f"sed -i '' -e a* {target}", f"sed -i '' -e 's/a/b/' -e a* {target}", "sed -n -i '' -e'' a*",
+            f"sed -n -i '' a[[:alpha:]]* {target}",
+            # Where the hook may read the command wrongly, nothing is dropped: `#` inside a word (shlex reads a
+            # comment), zsh glob qualifiers like d(N) and numeric globs like x<->, a quote with a redirect glued
+            # on, and backslashes in double quotes.
+            "sed -n -i '' q#x README.md", "echo 'a*'; sed -n -i '' a*#x README.md", "sed -n -i '' 'q'#x README.md",
+            "sed -n -i '' d(N) README.md", "sed -n -i '' x<->", f"sed -n -i '' ab<1-9> {target}", "sed -n -i '' <->d",
+            "sed -n -i '' 'h'2>/dev/null", "sed -n -i '' 'h'2>&1",
+            f"echo \"\\\\\" ; sed -n -i '' a* {target} ; echo '\"\\' 'a*'",
+            "echo \"'\"; sed -n -i '' q#x README.md; echo \"'\"",
+            f"echo \"\\\"\" ; sed -n -i '' a* {target} ; echo '\"' 'a*'",
+            # The same text unquoted anywhere in the command isn't literal.
+            f"echo 'a*'; sed -n -i '' a* {target}",
+            # A BSD suffix with a "/" puts the backup somewhere else.
+            f"sed -i '/../../x' 's/a/b/' {target}",
+        ]
+        # BSD reads a word after -i as the suffix and then has no file to edit (it refuses -i on stdin), and has no
+        # long options; GNU edits these.
+        gnu_only = {"sed -e 's/a/b/' -i .env", "sed -f s.sed -i .gitignore", "sed --e=s/a/b/ -i .env",
+                    "sed -e 's/a/b/' -i ./CLAUDE.md"}
+        refused += [c for c in big if flavour == "gnu" or c not in gnu_only]
+        if flavour == "gnu":
+            # GNU reads -i's next word as the script, so the word after it is a file: one named there, through a
+            # folder link (the OS follows it before ".."), a dangling link or a folder.
+            for name in ("p", "d", "="):
+                write(os.path.join(self.b, name), "a\n")
+            refused += ["sed -i '' p", f"sed -i '' p {target}", "sed -i '' d", "sed -i '' =", "sed -n -i '' abc",
+                        "sed -n -i '' app/../p", f"sed -n -i '' {self.b}/app/../p", "sed -i '' q", "sed -i '' h",
+                        "cd -P sub && sed -n -i '' p", "dd of=ix status=none < CLAUDE.md; sed -n -i '' ix"]
+        for cmd in refused:
+            self.sed_refused(cmd)
+        # A long s script with many escapes is read in linear time (the hook has 15 s, and a timeout lets the call
+        # through), and so is a long run of spaces.
+        for script in ("s/" + "\\(\\[a\\]\\)\\." * 15 + "/x/g", "p" + " " * 40_000 + ";p"):
+            start = time.monotonic()
+            self.run_hook(f"sed -i '' '{script}' CLAUDE.md", cwd=self.b, session=uuid.uuid4().hex)
+            self.assertLess(time.monotonic() - start, 3, "a long script is checked quickly")
+        # From a folder that isn't a checkout, a brace or backtick path into the main checkout is still refused, and a
+        # script file full of blank lines doesn't slow the hook (it isn't read).
+        for cmd in (f"sed -i '' 's/a/b/' {self.b}/{{CLAUDE,README}}.md", f"sed -i '' 's/a/b/' {self.b}/CLAUDE.md{{,}}",
+                    f"sed -i '' 's/a/b/' \"{self.b}/`echo CLAUDE.md`\"", f"sed -i -f {blanks} {self.b}/CLAUDE.md"):
+            start = time.monotonic()
+            self.sed_refused(cmd, cwd=self.scratch)
+            self.assertLess(time.monotonic() - start, 3, cmd)
 
     # --- the main checkout guard ---
 
