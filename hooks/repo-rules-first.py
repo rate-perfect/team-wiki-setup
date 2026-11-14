@@ -387,24 +387,89 @@ def sed_in_place(args):
     return False
 
 
-def sed_files(args, here):
-    """The files an in-place sed may edit: every word that names an existing file. sed can only edit files that
-    exist, and which word is the script, a backup suffix or a file depends on BSD or GNU sed and on the order of
-    the arguments. So nothing is guessed from position: the empty word (BSD's `-i ''`) is a folder and a script
-    like `s/a/b/` names no file, so neither counts. A script file (`-f script.sed`) that exists counts too, which
-    at worst adds a refusal."""
+# A sed script word: an optional address (a line number, `$`, or `/re/`, possibly a range), then a command. The
+# command must end the word or be followed by space or `;` (so `/abs/new.md` is a path), or be s/y with a delimiter.
+SED_ADDR = r"(?:\d+|\$|/[^/]*/)(?:\s*,\s*(?:\d+|\$|/[^/]*/))?"
+SED_SCRIPT = re.compile(r"^\s*(?:" + SED_ADDR + r")?\s*!?\s*(?:[sy]([^\w\s\\]).*|[a-zA-Z=](?:[\s;].*)?|\{.*)$", re.S)
+# Files a sed script writes (`w file`, `W file`, `s/a/b/w file`) and GNU's `e` (run a command).
+SED_WRITES = re.compile(r"(?:^|[;\n}])\s*(?:" + SED_ADDR + r")?\s*!?\s*[wW]\s+(\S+)|s([^\w\s\\])(?:\\.|(?!\2).)*\2(?:\\.|(?!\2).)*\2[gpIiMm0-9]*w\s*(\S+)")
+SED_RUNS = re.compile(r"(?:^|[;\n}])\s*(?:" + SED_ADDR + r")?\s*!?\s*e(?:\s|;|$)|s([^\w\s\\])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpIiMmw0-9]*e")
+# Words the shell still expands after the hook has seen them. Checked before the script test: `{a,b}` brace
+# expansion, command substitution, `${...}`, `~+`/`~-`, and a whole-word `$NAME` (or `$` with one capital
+# letter) are taken as shell. A bare `$` with a lowercase command is sed's last line (`$d`), and `$` inside a
+# script (`s/a$//`) is an anchor, so other words with `$` are checked only when they aren't scripts.
+SHELL_EXPANDS = re.compile(r"`|\$\(|\$\{|\{[^{}\s;]*,[^{}\s;]*\}|^~[+-]|^\$[A-Za-z_][A-Za-z0-9_]+$|^\$[A-Z_]$")
+MAX_GLOB_SEGMENTS = 3
+
+
+def sed_script_targets(script, here):
+    """Where a sed script writes: files named by `w`, `W` or the s///w flag, and the current folder for GNU's
+    `e` (it runs a command)."""
     out = []
-    for a in args:
-        if not a or a.startswith("-"):
+    for m in SED_WRITES.finditer(script):
+        name = m.group(1) or m.group(3)
+        if name:
+            out.append(resolve(name, here))
+    if SED_RUNS.search(script):
+        out.append(here)
+    return out
+
+
+def sed_files(args, here):
+    """Where an in-place sed may write. Like main, every word counts, whether or not the file exists yet, except
+    words that are positively not a target: the empty word and BSD's backup suffix after a bare -i (`-i ''`,
+    `-i .bak`, when no such file exists), and a word that is a sed script and not an existing file. Scripts (also those given with -e or -f) count the files they write. A word the shell
+    would still expand (`$(...)`, backticks, `$VAR`, `{a,b}`, `~+`) counts the current folder, and a glob counts
+    what it matches, or else its folder. Reading this wrongly can only add a refusal."""
+    out, skip_next, script_flag = [], False, None
+    for i, a in enumerate(args):
+        if skip_next:
+            skip_next = False
+            if script_flag in ("-e", "--expression"):
+                out += sed_script_targets(a, here)
+            elif script_flag in ("-f", "--file"):
+                out += sed_script_targets(read_text(resolve(a, here)) or "", here)
+            continue
+        if a in ("-e", "--expression", "-f", "--file"):
+            skip_next, script_flag = True, a
+            continue
+        if (a == "-i" and i + 1 < len(args) and (args[i + 1] == "" or args[i + 1].startswith("."))
+                and not os.path.isfile(resolve(args[i + 1], here))):
+            skip_next, script_flag = True, None  # BSD's backup suffix (`-i .bak`); a real file there still counts
+            continue
+        if a.startswith("-e") and len(a) > 2:
+            out += sed_script_targets(a[2:], here)
+            continue
+        if a.startswith("--") and "=" in a:
+            out += sed_script_targets(a.split("=", 1)[1], here)
+            continue
+        if a.startswith("-") and a != "-":
+            continue
+        if not a:
             continue
         path = resolve(a, here)
-        if any(ch in a for ch in "*?["):
-            # The hook sees the command before the shell expands it (`*.md`): count what it matches, or else the
-            # folder it would match in, so a glob can never slip past.
-            out += [m for m in glob.glob(path) if os.path.isfile(m)] or [os.path.dirname(path) or here]
-        elif os.path.isfile(path):
+        if SHELL_EXPANDS.search(a):
+            out.append(here)
+        elif SED_SCRIPT.match(a) and not os.path.isfile(path):
+            out += sed_script_targets(a, here)
+        elif "$" in a:
+            out.append(here)
+        elif any(ch in a for ch in "*?["):
+            out += glob_targets(path, here)
+        else:
             out.append(path)
     return out
+
+
+def glob_targets(pattern, here):
+    """The files a glob matches, or its folder when it matches none, is too deep to walk quickly, or can't be read."""
+    folder = os.path.dirname(pattern) or here
+    if sum(1 for part in pattern.split(os.sep) if any(ch in part for ch in "*?[")) > MAX_GLOB_SEGMENTS:
+        return [folder]
+    try:
+        return [m for m in glob.glob(pattern) if os.path.isfile(m)] or [folder]
+    except (ValueError, OSError):
+        return [folder]
 
 
 def segment_targets(tokens, here, guard=False):
