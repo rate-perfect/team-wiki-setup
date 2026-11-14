@@ -376,6 +376,28 @@ def resolve(path, here):
     return os.path.normpath(path if os.path.isabs(path) else os.path.join(here or "/", path))
 
 
+def sed_files(args):
+    """The files `sed -i` edits: its arguments after the script, leaving out the script itself (the first argument
+    unless -e/-f gave it), the values of -e/-f, and BSD sed's backup suffix after a bare -i (`sed -i '' ...`,
+    `sed -i .bak ...`). GNU sed takes the suffix attached (`-i.bak`), so a word after a bare -i is the script there:
+    a word that is empty or starts with "." can't be a sed script, so it's read as the suffix."""
+    files, script_given, skip = [], False, False
+    for i, a in enumerate(args):
+        if skip:
+            skip = False
+        elif a == "-i" and i + 1 < len(args) and (args[i + 1] == "" or args[i + 1].startswith(".")):
+            skip = True
+        elif a in ("-e", "--expression", "-f", "--file"):
+            script_given, skip = True, True
+        elif a.startswith("--expression=") or a.startswith("--file=") or (a.startswith(("-e", "-f")) and len(a) > 2):
+            script_given = True
+        elif a.startswith("-") and a != "-":
+            continue
+        elif a:
+            files.append(a)
+    return files if script_given else files[1:]
+
+
 def segment_targets(tokens, here, guard=False):
     """Folders a single shell segment would change, or [] if it changes nothing. `guard`: read builds the way the
     main checkout guard does (never more permissive than main); otherwise as the rules check does."""
@@ -414,7 +436,7 @@ def segment_targets(tokens, here, guard=False):
         return targets
     plain = [a for a in args if not a.startswith("-")]
     if cmd == "sed" and any(a.startswith("-i") for a in args):
-        targets += [resolve(a, here) for a in plain[1:]]
+        targets += [resolve(a, here) for a in sed_files(args)]
     elif cmd in FILE_WRITERS:
         targets += [resolve(a, here) for a in plain] or [here]
     elif cmd in LAST_ARG_WRITERS and plain:

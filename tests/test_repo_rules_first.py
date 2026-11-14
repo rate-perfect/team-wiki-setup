@@ -342,6 +342,21 @@ class RepoRulesFirst(unittest.TestCase):
         for cmd in ("make -C ../repo-c -C $SUB", "npm --prefix ../repo-c --prefix \"$D\" test"):
             self.assert_paused_for(self.run_hook(cmd), c, cmd)
 
+    def test_sed_in_place_counts_only_the_files_it_edits(self):
+        # From a main checkout, editing a file elsewhere with sed -i isn't a change to the main checkout: the empty
+        # BSD backup suffix and the script aren't files.
+        write(os.path.join(self.home, ".claude", "CLAUDE.md"), "# Never change a main checkout\nWork in a worktree.\n")
+        target = os.path.join(self.scratch, "notes.txt")
+        write(target, "a\n")
+        for cmd in (f"sed -i '' 's/a/b/' {target}", f"sed -i .bak 's/a/b/' {target}", f"sed -i -e 's/a/b/' {target}",
+                    f"sed -i.bak -e 's/a/b/' -e 's/c/d/' {target}"):
+            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
+            self.assertTrue(r is None or not r.startswith("MAIN CHECKOUT"), f"{cmd}: {r}")
+        # A file in the main checkout itself is still refused.
+        for cmd in ("sed -i '' 's/a/b/' CLAUDE.md", "sed -i 's/a/b/' CLAUDE.md", "sed -i -e 's/a/b/' CLAUDE.md"):
+            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
+            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
+
     # --- the main checkout guard ---
 
     def test_main_checkout_guard_refuses_builds_there_but_not_running_its_code(self):
