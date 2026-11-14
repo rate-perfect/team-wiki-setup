@@ -342,6 +342,54 @@ class RepoRulesFirst(unittest.TestCase):
         for cmd in ("make -C ../repo-c -C $SUB", "npm --prefix ../repo-c --prefix \"$D\" test"):
             self.assert_paused_for(self.run_hook(cmd), c, cmd)
 
+    def test_sed_in_place_counts_only_the_files_it_edits(self):
+        # From a main checkout, editing a file elsewhere with sed -i isn't a change to the main checkout: the empty
+        # BSD backup suffix and the script aren't files.
+        write(os.path.join(self.home, ".claude", "CLAUDE.md"), "# Never change a main checkout\nWork in a worktree.\n")
+        target = os.path.join(self.scratch, "notes.txt")
+        write(target, "a\n")
+        for cmd in (f"sed -i '' 's/a/b/' {target}", f"sed -i .bak 's/a/b/' {target}", f"sed -i -e 's/a/b/' {target}",
+                    f"sed -i.bak -e 's/a/b/' -e 's/c/d/' {target}", f"sed -i '' 's/a.*/b/' {target}",
+                    f"sed -i '' 's/[0-9]//' {target}", f"sed -i '' -E 's/a?/b/' {target}", f"sed -i '' '1d' {target}",
+                    f"sed -i '' '/^#/d' {target}", f"sed -i '' 's|a|b|g' {target}", f"sed -i '' '$d' {target}",
+                    f"sed -i '' 's/a$//' {target}"):
+            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
+            self.assertTrue(r is None or not r.startswith("MAIN CHECKOUT"), f"{cmd}: {r}")
+        # A long s script with many escapes is read in linear time (the hook has 15 s, and a timeout lets the call
+        # through).
+        script = "s/" + "\\(\\[a\\]\\)\\." * 15 + "/x/g"
+        start = time.monotonic()
+        self.run_hook(f"sed -i '' '{script}' CLAUDE.md", cwd=self.b, session=uuid.uuid4().hex)
+        self.assertLess(time.monotonic() - start, 3, "a script with 60 escapes is checked quickly")
+        # A file in the main checkout itself is still refused, in BSD and GNU forms and any argument order: GNU
+        # reads a "."-word after -i as a file once the script is known, an empty script empties a file with -n,
+        # and -I, -Ei, -ni and --in-place (shortened too) edit in place.
+        write(os.path.join(self.b, ".env"), "a\n")
+        write(os.path.join(self.b, ".gitignore"), "a\n")
+        for cmd in ("sed -i '' 's/a/b/' CLAUDE.md", "sed -i 's/a/b/' CLAUDE.md", "sed -i -e 's/a/b/' CLAUDE.md",
+                    "sed -e 's/a/b/' -i .env", "sed 's/a/b/' -i .env", "sed -f s.sed -i .gitignore",
+                    "sed -e 's/a/b/' -i ./CLAUDE.md", "sed -I '' 's/a/b/' CLAUDE.md", "sed -Ei '' 's/a/b/' CLAUDE.md",
+                    "sed -ni '' 's/a/b/p' CLAUDE.md", "sed --in-place 's/a/b/' CLAUDE.md",
+                    "sed --in-place=.bak 's/a/b/' CLAUDE.md", "sed -i --expr=s/a/b/ CLAUDE.md",
+                    "sed -n -i.bak '' CLAUDE.md", "sed -n -i '' '' CLAUDE.md", "sed -i '' -n '' CLAUDE.md",
+                    "sed -n -i '' CLAUDE.md", "sed '' -n -i CLAUDE.md", "sed --in 's/a/b/' CLAUDE.md",
+                    "sed --in-pl=.bak 's/a/b/' CLAUDE.md", "sed -i --e=s/a/b/ CLAUDE.md", "sed --e=s/a/b/ -i .env",
+                    "sed -i '' 's/a/b/' *.md", "sed -i 's/a/b/' src/*.nothing",
+                    "sed -i '' 's/foo/bar/g' $(grep -rl foo .)", "sed -i '' 's/a/b/' `grep -rl a .`",
+                    "sed -i '' 's/a/b/' {CLAUDE,README}.md", "sed -i '' 's/a/b/' ~+/CLAUDE.md",
+                    f"sed -i '' 's/a/b/w out.txt' {target}", f"sed -i '' -e 'w out.txt' {target}",
+                    f"sed -i '' '1e touch x' {target}", "cd -P src && sed -i '' 's/a/b/' lib.ts",
+                    "curl -so new.md https://example.com && sed -i '' 's/a/b/' new.md", "sed -i '' 's/a/b/' \"$F\"", "sed -i '' 's/a/b/' $FILES", "sed -i '' 's/a/b/' ${F}",
+                    "sed -i '' 's/a/b/' docs/{guide,other}.md",
+                    "for f in *.md; do\n  sed -i '' 's/a/b/' \"$f\"\ndone",
+                    "ls | while read -r f; do\n sed -i '' 's/a/b/' \"$f\"\ndone",
+                    f"sed -i '' '1{{w CLAUDE.md\n}}' {target}", f"sed -i '' -e '1{{w CLAUDE.md' -e '}}' {target}",
+                    f"sed -i '' '1!{{w CLAUDE.md\n}}' {target}", f"sed -i '' 's/a/b/ w CLAUDE.md' {target}",
+                    f"sed -i '' 'p;wCLAUDE.md' {target}", "cd -P src && sed -i '' 's/a/b/' s.md",
+                    "sed -i '' 's/a/b/' {1..3}.md", "sed -i '' 's/a/b/' s.md x"):
+            r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
+            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
+
     # --- the main checkout guard ---
 
     def test_main_checkout_guard_refuses_builds_there_but_not_running_its_code(self):
