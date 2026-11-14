@@ -355,6 +355,12 @@ class RepoRulesFirst(unittest.TestCase):
                     f"sed -i '' 's/a$//' {target}"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
             self.assertTrue(r is None or not r.startswith("MAIN CHECKOUT"), f"{cmd}: {r}")
+        # A long s script with many escapes is read in linear time (the hook has 15 s, and a timeout lets the call
+        # through).
+        script = "s/" + "\\(\\[a\\]\\)\\." * 15 + "/x/g"
+        start = time.monotonic()
+        self.run_hook(f"sed -i '' '{script}' CLAUDE.md", cwd=self.b, session=uuid.uuid4().hex)
+        self.assertLess(time.monotonic() - start, 3, "a script with 60 escapes is checked quickly")
         # A file in the main checkout itself is still refused, in BSD and GNU forms and any argument order: GNU
         # reads a "."-word after -i as a file once the script is known, an empty script empties a file with -n,
         # and -I, -Ei, -ni and --in-place (shortened too) edit in place.
@@ -374,7 +380,13 @@ class RepoRulesFirst(unittest.TestCase):
                     f"sed -i '' 's/a/b/w out.txt' {target}", f"sed -i '' -e 'w out.txt' {target}",
                     f"sed -i '' '1e touch x' {target}", "cd -P src && sed -i '' 's/a/b/' lib.ts",
                     "curl -so new.md https://example.com && sed -i '' 's/a/b/' new.md", "sed -i '' 's/a/b/' \"$F\"", "sed -i '' 's/a/b/' $FILES", "sed -i '' 's/a/b/' ${F}",
-                    "sed -i '' 's/a/b/' docs/{guide,other}.md"):
+                    "sed -i '' 's/a/b/' docs/{guide,other}.md",
+                    "for f in *.md; do\n  sed -i '' 's/a/b/' \"$f\"\ndone",
+                    "ls | while read -r f; do\n sed -i '' 's/a/b/' \"$f\"\ndone",
+                    f"sed -i '' '1{{w CLAUDE.md\n}}' {target}", f"sed -i '' -e '1{{w CLAUDE.md' -e '}}' {target}",
+                    f"sed -i '' '1!{{w CLAUDE.md\n}}' {target}", f"sed -i '' 's/a/b/ w CLAUDE.md' {target}",
+                    f"sed -i '' 'p;wCLAUDE.md' {target}", "cd -P src && sed -i '' 's/a/b/' s.md",
+                    "sed -i '' 's/a/b/' {1..3}.md", "sed -i '' 's/a/b/' s.md x"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
             self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
 
