@@ -364,7 +364,8 @@ class RepoRulesFirst(unittest.TestCase):
                     "sed --in-place=.bak 's/a/b/' CLAUDE.md", "sed -i --expr=s/a/b/ CLAUDE.md",
                     "sed -n -i.bak '' CLAUDE.md", "sed -n -i '' '' CLAUDE.md", "sed -i '' -n '' CLAUDE.md",
                     "sed -n -i '' CLAUDE.md", "sed '' -n -i CLAUDE.md", "sed --in 's/a/b/' CLAUDE.md",
-                    "sed --in-pl=.bak 's/a/b/' CLAUDE.md", "sed -i --e=s/a/b/ CLAUDE.md", "sed --e=s/a/b/ -i .env"):
+                    "sed --in-pl=.bak 's/a/b/' CLAUDE.md", "sed -i --e=s/a/b/ CLAUDE.md", "sed --e=s/a/b/ -i .env",
+                    "sed -i '' 's/a/b/' *.md", "sed -i 's/a/b/' src/*.nothing"):
             r = self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex)
             self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
 

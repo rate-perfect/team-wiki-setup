@@ -28,6 +28,7 @@ find the repo named in a PR command (gh pr create --repo ..., az repos pr create
 
 Distributed by https://github.com/rate-perfect/team-wiki-setup (install.sh). Change it there, not in ~/.claude/hooks.
 """
+import glob
 import hashlib
 import json
 import os
@@ -397,7 +398,11 @@ def sed_files(args, here):
         if not a or a.startswith("-"):
             continue
         path = resolve(a, here)
-        if os.path.isfile(path):
+        if any(ch in a for ch in "*?["):
+            # The hook sees the command before the shell expands it (`*.md`): count what it matches, or else the
+            # folder it would match in, so a glob can never slip past.
+            out += [m for m in glob.glob(path) if os.path.isfile(m)] or [os.path.dirname(path) or here]
+        elif os.path.isfile(path):
             out.append(path)
     return out
 
