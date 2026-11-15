@@ -409,8 +409,7 @@ class RepoRulesFirst(unittest.TestCase):
         other = os.path.join(self.scratch, "other.txt")
         for path in (target, other):
             write(path, "a\n")
-        for name in ("abc", "ax", "README.md", ".env", ".gitignore", "p", "q", "s.sed", "sub/p", "sub/d",
-                     "sub/sub2/keep"):
+        for name in ("abc", "ax", "README.md", ".env", ".gitignore", "p", "q", "s.sed", "sub/p", "sub/d"):
             write(os.path.join(self.b, name), "a\n")
         blanks = os.path.join(self.scratch, "s.sed")
         write(blanks, "s/a/b/\n" + "   \n" * 300 + "p\n")
@@ -462,13 +461,11 @@ class RepoRulesFirst(unittest.TestCase):
                      f"sed -i '' 's/a$//' {target}", f"sed -i '' 's/ *$//' {target}", f"sed -i '' 's/a.*/b/' {target}",
                      f"sed -i '' 's/a/b/M' {target}", f"sed -i '' 'y/ab/cd/' {target}",
                      f"sed -i '' 's/a/b/;s/c/d/' {target}", f"sed -i '' 's/a/b/' {target} {other}",
-                     f"sed -i '' 's/a/b/' {target} 2>/dev/null", f"sed -i '' 's/a/b/' {target} && echo ok",
+                     f"sed -i '' 's/a/b/' {target} 2>/dev/null",
                      f"sed -i '' 's/a/b/' '{target}'", f"sed -i '' 's/a/b/' '{braced}'",
-                     f"sed -r -i '' 's/(a)/b/' {target}", f"cd sub; sed -i '' 'x' {target}",
+                     f"sed -r -i '' 's/(a)/b/' {target}",
                      f"sed -i '' 's/foo/&bar/' {target}", f"sed -i '' 's/^/& /' {target}",
-                     f"grep -q 'x$' {target} && sed -i '' 's/a/b/' {target}",
-                     f"sed -i '' 's/a/b/' {target} &>/dev/null", f"sed -i '' 's/a/b/' {target} 2>&1",
-                     f"cd sub; cd sub2; sed -i '' 'x' {target}"]
+                     f"sed -i '' 's/a/b/' {target} &>/dev/null", f"sed -i '' 's/a/b/' {target} 2>&1"]
         # As on main: GNU's -i takes no separate word, so the first word is the script.
         # Main counted every word but the first and the flags: with -f, the script file and the files are elsewhere.
         # The -f script file is read, not written, so one in the main checkout is fine.
@@ -547,7 +544,11 @@ class RepoRulesFirst(unittest.TestCase):
             f"echo s/a/b/; sed -i '' 's/a/b/' README.md",
             # A folder move the hook doesn't follow exactly: the exception looks for the script's name in the folder
             # the command runs in.
-            # `d` is a file only in sub/, so only these rules refuse them.
+            # Anything before or around the sed: the hook can't always tell which folder it runs in, or whether a
+            # file named like the script was made first, so only a lone sed gets the exception. (`d` is a file only
+            # in sub/.)
+            f"cd sub; sed -i '' 'x' {target}", f"sed -i '' 's/a/b/' {target} && echo ok",
+            f">&2cd sub; sed -i '' 'q' {target}", f"${{x}}cd sub; sed -i '' 'd' {target}",
             f"{{ cd sub; sed -i '' 'd' {target}; }}", f"cd -P sub && sed -i '' 'd' {target}",
             f"pushd sub && sed -i '' 'd' {target}", f"builtin cd sub && sed -i '' 'd' {target}",
             f"chdir sub && sed -i '' 'd' {target}", f"popd; sed -i '' 'd' {target}",
@@ -569,16 +570,6 @@ class RepoRulesFirst(unittest.TestCase):
         refused += [c for c in big if not (flavour == "bsd" and c in bsd_suffix_no_file)]
         for cmd in refused:
             self.sed_refused(cmd)
-        if flavour == "bsd":
-            # With CDPATH, `cd sub` may go to another sub/ (here: one under the scratch folder) than the one the hook
-            # follows, so the exception is off.
-            os.makedirs(os.path.join(self.scratch, "sub"), exist_ok=True)
-            os.environ["CDPATH"] = self.scratch
-            try:
-                self.sed_refused(f"cd sub; sed -i '' 'x' {target}")
-            finally:
-                os.environ.pop("CDPATH")
-            self.sed_allowed(f"cd sub; sed -i '' 'x' {target}")
         # A long script is read in linear time (the hook has 15 s, and a timeout lets the call through).
         for script in ("s/" + "\\(\\[a\\]\\)\\." * 15 + "/x/g", "p" + " " * 40_000 + ";p", "s/" + "a" * 50_000):
             start = time.monotonic()

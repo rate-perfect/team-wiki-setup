@@ -114,8 +114,9 @@ Optional settings for the repo rules hook:
   checkout. With macOS's own sed, `sed -i '' 's/a/b/' /other/file` run from a
   main checkout edits only `/other/file`, so it is allowed when the script is
   in single quotes and plain (only `s`, `y` and commands such as `d`, `p`
-  or `q`; no write, read or run, no `[`) and nothing else is unusual about
-  the command. The hook assumes GNU sed unless
+  or `q`; no write, read or run, no `[`), the sed is the whole command (no
+  `cd x &&` before it or `&& ...` after it) and nothing else is unusual
+  about it. The hook assumes GNU sed unless
   it is sure `sed` is macOS's; set `REPO_RULES_SED=bsd` or `gnu` to say which.
   Delete the section to turn it off.
 

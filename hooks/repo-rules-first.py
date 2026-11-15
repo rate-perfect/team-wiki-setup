@@ -157,7 +157,7 @@ def candidate_paths(tool, ti, cwd):
     # The folders each simple command would write to (same reading as the main checkout guard).
     here = cwd
     budget = [MAX_IMPORTS_PER_COMMAND, MAX_SCRIPTS_PER_COMMAND]
-    literal = sed_reading(ti.get("command") or "", cmd, cwd)
+    literal = sed_reading(ti.get("command") or "", cmd)
     for tokens in shell_segments(cmd):
         # `if cd x; then ...`, `{ cd x && ...; }`. The main checkout guard deliberately reads segments as main does,
         # so it doesn't see a build behind a shell keyword or a wrapper (`timeout`, `env`) at all.
@@ -505,38 +505,18 @@ def literal_words(cmd):
     return whole - other
 
 
-def sed_reading(raw, cmd, here):
+def sed_reading(raw, cmd):
     """`literal_words` of the command as written (`raw`), or None also when the hook's reading of it may differ from
-    the shell's: when `expand_vars` changed it (`cmd`; it fills in `$NAME` inside single quotes too), when CDPATH is
-    set or the command names cdpath, or when it moves to a folder the hook can't follow exactly. Only a run of plain
-    `cd <path>` commands at the very start is followed, in a command with no pipe (a cd after another command may
-    not run: `false && cd x`, `cd x | cat`), and not through "..". Only a plain `cd <path>` alone at the start of
-    a command is followed (not `cd -P`, `cd ~`, `cd +1`, `pushd`, `popd`, `chdir`, `eval`, `{ cd x; ...}`,
-    `builtin cd` or zsh's AUTO_CD, a folder's name alone), and sed's exception looks for the script's name in the
-    folder the command runs in."""
-    if cmd != raw or os.environ.get("CDPATH") or re.search(r"cdpath", raw, re.I):
+    the shell's: when `expand_vars` changed it (`cmd`; it fills in `$NAME` inside single quotes too), or when it is
+    more than one simple command. sed's exception looks for the script's name in the folder the command runs in, and
+    with anything before or around the sed (`cd x;`, `false && cd x`, `{ cd x; }`, a heredoc, a pipe) the hook can't
+    always tell which folder that is, or whether a file of that name was made first. A lone sed runs in the folder
+    the call starts in."""
+    if cmd != raw:
         return None
     literal = literal_words(raw)
-    if literal is None:
+    if literal is None or len(shell_segments(raw)) != 1:
         return None
-    folder = here or "/"
-    only_cds_so_far = True
-    for tokens in shell_segments(raw):
-        for i, t in enumerate(tokens):
-            if t in ("cd", "pushd", "popd", "chdir", "eval"):
-                if (t != "cd" or i != 0 or len(tokens) != 2 or not only_cds_so_far or "|" in raw
-                        or tokens[1].startswith(("-", "+")) or ".." in tokens[1].split("/")
-                        or SED_EXPANDS.search(tokens[1]) or not os.path.isdir(os.path.join(folder, tokens[1]))):
-                    # The last one: a `cd` that fails leaves the shell where it was.
-                    return None
-        # zsh's AUTO_CD: a folder's name alone moves there (in an interactive zsh; `zsh -c` doesn't, so this is
-        # only extra care).
-        if len(tokens) == 1 and os.path.isdir(os.path.join(folder, tokens[0])):
-            return None
-        if tokens and tokens[0] == "cd":
-            folder = os.path.join(folder, tokens[1])
-        elif tokens:
-            only_cds_so_far = False
     return literal
 
 
@@ -1109,7 +1089,7 @@ def main_checkout_violation(tool, ti, cwd):
         return None
     cmd = expand_vars(ti.get("command") or "")
     here = cwd
-    literal = sed_reading(ti.get("command") or "", cmd, cwd)
+    literal = sed_reading(ti.get("command") or "", cmd)
     for tokens in shell_segments(cmd):
         if tokens and tokens[0] == "cd":
             if len(tokens) > 1 and "$" not in tokens[1]:
