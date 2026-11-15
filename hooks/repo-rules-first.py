@@ -477,7 +477,7 @@ def literal_words(cmd):
         if c == "$" and cmd[i + 1:i + 2] == "'":
             return None  # `$'...'`: zsh reads escapes in it that the hook doesn't
         if c == "&" and cmd[i - 1:i] not in ("&", ">") and cmd[i + 1:i + 2] not in ("&", ">"):
-            return None  # a lone `&` runs what comes before it in the background, so a `cd` there doesn't move the rest
+            return None  # a lone `&` ends a command and runs it in the background
         if c in "<>" and started and not (not had_quote and "".join(word).isdigit()):
             # `'h'2>x` and zsh's numeric globs (`x<->`, `<1-9>d`) are one word to the shell, not a word and a
             # redirect. Only a plain fd number (`2>`) may come right before a redirect.
@@ -507,8 +507,8 @@ def literal_words(cmd):
 
 def sed_reading(raw, cmd):
     """`literal_words` of the command as written (`raw`), or None also when the hook's reading of it may differ from
-    the shell's: when `expand_vars` changed it (`cmd`; it fills in `$NAME` inside single quotes too), or when it is
-    more than one simple command. sed's exception looks for the script's name in the folder the command runs in, and
+    the shell's: when `expand_vars` changed it (`cmd`; it fills in `$NAME` inside single quotes too), or when the
+    hook reads it as more than one simple command. sed's exception looks for the script's name in the folder the command runs in, and
     with anything before or around the sed (`cd x;`, `false && cd x`, `{ cd x; }`, a heredoc, a pipe) the hook can't
     always tell which folder that is, or whether a file of that name was made first. A lone sed runs in the folder
     the call starts in."""

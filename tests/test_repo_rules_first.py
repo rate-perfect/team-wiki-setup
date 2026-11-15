@@ -508,7 +508,7 @@ class RepoRulesFirst(unittest.TestCase):
             f"cat <<EOF; cd sub\nbody\nEOF\nsed -i '' 'x' {target}",
             # zsh lets quotes nest inside "${...}", so this runs `cd sub` where a plain reader sees quoted text.
             f"echo \"${{x:-\"'\"}}\"; cd sub; echo \"${{x:-\"'\"}}\"; sed -i '' 'x' {target}",
-            # A cd that may not run in this shell, or through "..".
+            # A cd before the sed, run or not.
             f"false && cd sub; sed -i '' 'x' {target}", f"cd sub | cat; sed -i '' 'x' {target}",
             f"cd sub/../sub; sed -i '' 'x' {target}",
             # Background and redirect forms of &.
@@ -542,8 +542,6 @@ class RepoRulesFirst(unittest.TestCase):
             f"echo \"\\\"\" ; sed -i '' 's/a/b/' README.md ; echo '\"'",
             # The same text unquoted elsewhere in the command isn't literal.
             f"echo s/a/b/; sed -i '' 's/a/b/' README.md",
-            # A folder move the hook doesn't follow exactly: the exception looks for the script's name in the folder
-            # the command runs in.
             # Anything before or around the sed: the hook can't always tell which folder it runs in, or whether a
             # file named like the script was made first, so only a lone sed gets the exception. (`d` is a file only
             # in sub/.)
@@ -553,7 +551,7 @@ class RepoRulesFirst(unittest.TestCase):
             f"pushd sub && sed -i '' 'd' {target}", f"builtin cd sub && sed -i '' 'd' {target}",
             f"chdir sub && sed -i '' 'd' {target}", f"popd; sed -i '' 'd' {target}",
             f"cd sub x && sed -i '' 'd' {target}", f"cd $D && sed -i '' 'd' {target}",
-            # `cd sub x` fails in bash and leaves the shell here, where `q` is a file; the hook would follow it.
+            # `cd sub x` fails in bash and leaves the shell here, where `q` is a file.
             f"cd sub x; sed -i '' 'q' {target}",
             f"echo x && command cd sub; sed -i '' 'd' {target}", f"echo cd; sed -i '' 'd' {target}",
             f"cd -; sed -i '' 'd' {target}", f"cd ~rrf-no-such-user; sed -i '' 'd' {target}", f"cd +1; sed -i '' 'd' {target}",
