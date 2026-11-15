@@ -367,6 +367,24 @@ class RepoRulesFirst(unittest.TestCase):
             os.environ["PATH"] = saved["PATH"] or ""
             if sys.platform != "darwin":
                 self.assertEqual(hook.sed_flavour(), "gnu", "only macOS has BSD sed as sed")
+            else:
+                real_which, real_places = hook.shutil.which, hook.GNU_SED_PLACES
+                try:
+                    hook.GNU_SED_PLACES = ()
+                    hook.shutil.which = lambda name: "/usr/bin/sed"
+                    os.environ["PATH"] = "/usr/bin:/bin"
+                    self.assertEqual(hook.sed_flavour(), "bsd", "macOS's own sed, nothing else installed")
+                    os.environ["PATH"] = "/usr/local/opt/gnu-sed/libexec/bin:/usr/bin"
+                    self.assertEqual(hook.sed_flavour(), "gnu", "a gnu-sed folder on PATH")
+                    os.environ["PATH"] = "/usr/bin:/bin"
+                    hook.shutil.which = lambda name: "/opt/homebrew/bin/sed"
+                    self.assertEqual(hook.sed_flavour(), "gnu", "sed isn't /usr/bin/sed")
+                    hook.shutil.which = lambda name: "/usr/bin/sed"
+                    hook.GNU_SED_PLACES = (here_marker := tempfile.mkdtemp(dir=self.tmp),)
+                    self.assertEqual(hook.sed_flavour(), "gnu", "a GNU sed is installed where a profile may use it")
+                finally:
+                    hook.shutil.which, hook.GNU_SED_PLACES = real_which, real_places
+                    os.environ["PATH"] = saved["PATH"] or ""
             # Whatever the flavour, the exception needs the script not to be a path in the folder.
             here = tempfile.mkdtemp(dir=self.tmp)
             write(os.path.join(here, "p"), "a\n")
@@ -389,7 +407,7 @@ class RepoRulesFirst(unittest.TestCase):
         other = os.path.join(self.scratch, "other.txt")
         for path in (target, other):
             write(path, "a\n")
-        for name in ("abc", "ax", "README.md", ".env", ".gitignore", "p", "sub/p"):
+        for name in ("abc", "ax", "README.md", ".env", ".gitignore", "p", "q", "sub/p", "sub/d"):
             write(os.path.join(self.b, name), "a\n")
         blanks = os.path.join(self.scratch, "s.sed")
         write(blanks, "s/a/b/\n" + "   \n" * 300 + "p\n")
@@ -430,11 +448,12 @@ class RepoRulesFirst(unittest.TestCase):
                 os.environ["REPO_RULES_SED"] = saved
 
     def check_sed_flavour(self, flavour, target, other, blanks, big):
+        parent, bname = os.path.dirname(self.b), os.path.basename(self.b)
         exception = [f"sed -i '' 's/a/b/' {target}", f"sed -i .bak 's/a/b/' {target}", f"sed -E -i '' 's/a?/b/' {target}",
                      f"sed -n -i '' 's/a/b/p' {target}", f"sed -i '' -E 's/(a|b)/x/' {target}", f"sed -i '' '1d' {target}",
                      f"sed -i '' '/^#/d' {target}", f"sed -i '' 's|a|b|g' {target}", f"sed -i '' '$d' {target}",
                      f"sed -i '' 's/a$//' {target}", f"sed -i '' 's/ *$//' {target}", f"sed -i '' 's/a.*/b/' {target}",
-                     f"sed -i '' 's/[0-9]//' {target}", f"sed -i '' 's/a/b/M' {target}", f"sed -i '' 'y/ab/cd/' {target}",
+                     f"sed -i '' 's/a/b/M' {target}", f"sed -i '' 'y/ab/cd/' {target}",
                      f"sed -i '' 's/a/b/;s/c/d/' {target}", f"sed -i '' 's/a/b/' {target} {other}",
                      f"sed -i '' 's/a/b/' {target} 2>/dev/null", f"sed -i '' 's/a/b/' {target} && echo ok",
                      f"sed -i '' 's/a/b/' '{target}'"]
@@ -458,6 +477,16 @@ class RepoRulesFirst(unittest.TestCase):
             f"sed -I '' 's/a/b/' {target}", f"sed -Ei '' 's/a/b/' {target}", f"sed -i '' 'a\\' {target}",
             f"sed -i '' 's/a/b/w CLAUDE.md' {target}", f"sed -i '' 'w CLAUDE.md' {target}", f"sed -i '' '1e x' {target}",
             f"sed -i '' 'r CLAUDE.md' {target}", f"sed -i '' '1{{w CLAUDE.md\n}}' {target}",
+            # sed skips its delimiter inside a bracket expression, so these hide a `w`; any `[` is refused.
+            f"sed -i '' 's/[/x/;s|]/|/w out|' {target}",
+            f"sed -i '' 's/[0-9]//' {target}",
+            # `$NAME` filled in by the hook inside single quotes: the shell passes `$w src/g`, a write.
+            f"w=s/a/; sed -i '' '$w src/g' {target}", f"X=s/a/b/; sed -i '' $X {target}; echo 's/a/b/'",
+            # File words the shell expands into the main checkout, written as absolute paths.
+            f"sed -i '' 's/a/b/' {parent}/{{x,{bname}}}/README.md", f"sed -i '' 's/a/b/' {parent}/{bname[:-1]}?/README.md",
+            f"sed -i '' 's/a/b/' {parent}/{bname[:-2]}*/README.md",
+            f"sed -i '' 's/a/b/' {parent}/[{bname[0]}]{bname[1:]}/README.md",
+            f"sed -i '' 's/a/b/' {parent}/{bname}``/README.md",
             f"sed -i '' '' {target}",
             # A file word the shell expands, which the guard can't follow.
             "sed -i '' 's/a/b/' \"$F\"", "sed -i '' 's/a/b/' $F", "sed -i '' 's/a/b/' *.md", "sed -i '' 's/a/b/' ~/x",
@@ -476,8 +505,14 @@ class RepoRulesFirst(unittest.TestCase):
             f"echo s/a/b/; sed -i '' 's/a/b/' README.md",
             # A folder move the hook doesn't follow exactly: the exception looks for the script's name in the folder
             # the command runs in.
-            f"{{ cd sub; sed -i '' 'p' {target}; }}", f"cd -P sub && sed -i '' 'p' {target}",
-            f"pushd sub && sed -i '' 'p' {target}", f"builtin cd sub && sed -i '' 'p' {target}",
+            # `d` is a file only in sub/, so only these rules refuse them.
+            f"{{ cd sub; sed -i '' 'd' {target}; }}", f"cd -P sub && sed -i '' 'd' {target}",
+            f"pushd sub && sed -i '' 'd' {target}", f"builtin cd sub && sed -i '' 'd' {target}",
+            f"chdir sub && sed -i '' 'd' {target}", f"popd; sed -i '' 'd' {target}",
+            f"cd sub x && sed -i '' 'd' {target}", f"cd $D && sed -i '' 'd' {target}",
+            # `cd sub x` fails in bash and leaves the shell here, where `q` is a file; the hook would follow it.
+            f"cd sub x; sed -i '' 'q' {target}",
+            f"echo x && command cd sub; sed -i '' 'd' {target}",
             # GNU reads -i's next word as the script, so these edit files there.
             "sed -i '' p", "sed -n -i '' abc", "dd of=ix status=none < CLAUDE.md; sed -n -i '' ix",
         ]
