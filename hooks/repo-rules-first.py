@@ -449,9 +449,11 @@ def literal_words(cmd):
     `#`, "(", ")", a backslash, a lone `&` or `$'` outside quotes (shlex reads `#` inside a word as a comment and splits zsh glob
     qualifiers like `d(N)` at "("), a backslash in double quotes, an unclosed quote, or a quote or word glued to a
     redirect, one quoted part right after another (`'a''b'`, which zsh's RC_QUOTES reads as `a'b`), a control
-    character other than tab and newline (shlex splits words at \r, zsh doesn't), or a backtick. sed's one
+    character other than tab and newline (shlex splits words at \r, zsh doesn't), a backtick, a heredoc, or a "$"
+    in double quotes. sed's one
     exception (`sed_bsd_script`) then doesn't apply."""
-    cmd = HEREDOC.sub("<<HEREDOC\n", cmd)
+    if "<<" in cmd:
+        return None  # a heredoc: the hook drops its body and the rest of its first line, which zsh still runs
     # shlex splits words at \r (and other control characters) where zsh doesn't, and the hook doesn't run backticks.
     if re.search(r"[\x00-\x08\x0b-\x1f\x7f`]", cmd):
         return None
@@ -491,7 +493,8 @@ def literal_words(cmd):
             j = cmd.find('"', i + 1)
             # A backslash in double quotes can escape a quote; rather than follow it, give up (a second safeguard:
             # the scan also fails safe on the unbalanced quotes a misread leaves).
-            if j < 0 or "\\" in cmd[i + 1:j]:
+            # A "$" in double quotes may start ${...} or $(...), inside which zsh lets quotes nest.
+            if j < 0 or "\\" in cmd[i + 1:j] or "$" in cmd[i + 1:j]:
                 return None
             word.append(cmd[i + 1:j])
             had_quote = True
@@ -505,7 +508,9 @@ def literal_words(cmd):
 def sed_reading(raw, cmd, here):
     """`literal_words` of the command as written (`raw`), or None also when the hook's reading of it may differ from
     the shell's: when `expand_vars` changed it (`cmd`; it fills in `$NAME` inside single quotes too), when CDPATH is
-    set, or when it moves to a folder the hook can't follow exactly. Only a plain `cd <path>` alone at the start of
+    set or the command names cdpath, or when it moves to a folder the hook can't follow exactly. Only a run of plain
+    `cd <path>` commands at the very start is followed, in a command with no pipe (a cd after another command may
+    not run: `false && cd x`, `cd x | cat`), and not through "..". Only a plain `cd <path>` alone at the start of
     a command is followed (not `cd -P`, `cd ~`, `cd +1`, `pushd`, `popd`, `chdir`, `eval`, `{ cd x; ...}`,
     `builtin cd` or zsh's AUTO_CD, a folder's name alone), and sed's exception looks for the script's name in the
     folder the command runs in."""
@@ -515,19 +520,23 @@ def sed_reading(raw, cmd, here):
     if literal is None:
         return None
     folder = here or "/"
+    only_cds_so_far = True
     for tokens in shell_segments(raw):
         for i, t in enumerate(tokens):
             if t in ("cd", "pushd", "popd", "chdir", "eval"):
-                if (t != "cd" or i != 0 or len(tokens) != 2 or tokens[1].startswith(("-", "+"))
+                if (t != "cd" or i != 0 or len(tokens) != 2 or not only_cds_so_far or "|" in raw
+                        or tokens[1].startswith(("-", "+")) or ".." in tokens[1].split("/")
                         or SED_EXPANDS.search(tokens[1]) or not os.path.isdir(os.path.join(folder, tokens[1]))):
                     # The last one: a `cd` that fails leaves the shell where it was.
                     return None
-        if tokens and tokens[0] == "cd":
-            folder = os.path.join(folder, tokens[1])
         # zsh's AUTO_CD: a folder's name alone moves there (in an interactive zsh; `zsh -c` doesn't, so this is
         # only extra care).
-        elif len(tokens) == 1 and os.path.isdir(os.path.join(folder, tokens[0])):
+        if len(tokens) == 1 and os.path.isdir(os.path.join(folder, tokens[0])):
             return None
+        if tokens and tokens[0] == "cd":
+            folder = os.path.join(folder, tokens[1])
+        elif tokens:
+            only_cds_so_far = False
     return literal
 
 

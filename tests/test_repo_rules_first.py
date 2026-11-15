@@ -409,7 +409,8 @@ class RepoRulesFirst(unittest.TestCase):
         other = os.path.join(self.scratch, "other.txt")
         for path in (target, other):
             write(path, "a\n")
-        for name in ("abc", "ax", "README.md", ".env", ".gitignore", "p", "q", "s.sed", "sub/p", "sub/d"):
+        for name in ("abc", "ax", "README.md", ".env", ".gitignore", "p", "q", "s.sed", "sub/p", "sub/d",
+                     "sub/sub2/keep"):
             write(os.path.join(self.b, name), "a\n")
         blanks = os.path.join(self.scratch, "s.sed")
         write(blanks, "s/a/b/\n" + "   \n" * 300 + "p\n")
@@ -465,7 +466,9 @@ class RepoRulesFirst(unittest.TestCase):
                      f"sed -i '' 's/a/b/' '{target}'", f"sed -i '' 's/a/b/' '{braced}'",
                      f"sed -r -i '' 's/(a)/b/' {target}", f"cd sub; sed -i '' 'x' {target}",
                      f"sed -i '' 's/foo/&bar/' {target}", f"sed -i '' 's/^/& /' {target}",
-                     f"grep -q 'x$' {target} && sed -i '' 's/a/b/' {target}"]
+                     f"grep -q 'x$' {target} && sed -i '' 's/a/b/' {target}",
+                     f"sed -i '' 's/a/b/' {target} &>/dev/null", f"sed -i '' 's/a/b/' {target} 2>&1",
+                     f"cd sub; cd sub2; sed -i '' 'x' {target}"]
         # As on main: GNU's -i takes no separate word, so the first word is the script.
         # Main counted every word but the first and the flags: with -f, the script file and the files are elsewhere.
         # The -f script file is read, not written, so one in the main checkout is fine.
@@ -502,7 +505,18 @@ class RepoRulesFirst(unittest.TestCase):
             # Other ways the hook may read the command wrongly.
             f"sed -i '' 's/a/b/' {target} \\", f"sed -i '' 's/a/b/' {target} 'x", f"sed -i '' 's/a/b/' {target} )",
             f"echo $'a'; sed -i '' 'x' {target}", f"echo `true`; sed -i '' 's/a/b/' {target}",
-            f"cd sub; cd sub; sed -i '' 'x' {target}", f"cdpath+={self.scratch}; cd sub; sed -i '' 'x' {target}",
+            f"cd sub; cd sub; sed -i '' 'x' {target}",
+            # The hook drops a heredoc's body and the rest of its first line; zsh runs `cd sub` here.
+            f"cat <<EOF & cd sub\nbody\nEOF\nsed -i '' 'x' {target}",
+            f"cat <<EOF; cd sub\nbody\nEOF\nsed -i '' 'x' {target}",
+            # zsh lets quotes nest inside "${...}", so this runs `cd sub` where a plain reader sees quoted text.
+            f"echo \"${{x:-\"'\"}}\"; cd sub; echo \"${{x:-\"'\"}}\"; sed -i '' 'x' {target}",
+            # A cd that may not run in this shell, or through "..".
+            f"false && cd sub; sed -i '' 'x' {target}", f"cd sub | cat; sed -i '' 'x' {target}",
+            f"cd sub/../sub; sed -i '' 'x' {target}",
+            # Background and redirect forms of &.
+            f"sed -i '' 's/a/b/' {target} &", f"sed -i '' 's/a/b/' {target} &|", f"sed -i '' 's/a/b/' {target} &!",
+            f"echo a$'b'; sed -i '' 'x' {target}", f"cdpath+={self.scratch}; cd sub; sed -i '' 'x' {target}",
             # `..` through a link: the OS follows the link first, the guard reads `..` as written.
             f"sed -i '' 's/a/b/' {self.scratch}/lnk/../README.md",
             # zsh's EXTENDED_GLOB ^ expands a file word.
