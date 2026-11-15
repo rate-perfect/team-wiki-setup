@@ -361,6 +361,8 @@ class RepoRulesFirst(unittest.TestCase):
             for forced in ("bsd", "gnu"):
                 os.environ["REPO_RULES_SED"] = forced
                 self.assertEqual(hook.sed_flavour(), forced)
+            os.environ["REPO_RULES_SED"] = "macos"
+            self.assertIn(hook.sed_flavour(), ("bsd", "gnu"), "any other value means: work it out")
             os.environ.pop("REPO_RULES_SED")
             os.environ["PATH"] = os.pathsep.join(["/opt/x/libexec/gnubin", saved["PATH"] or ""])
             self.assertEqual(hook.sed_flavour(), "gnu", "a gnubin folder on PATH means GNU")
@@ -380,7 +382,7 @@ class RepoRulesFirst(unittest.TestCase):
                     hook.shutil.which = lambda name: "/opt/homebrew/bin/sed"
                     self.assertEqual(hook.sed_flavour(), "gnu", "sed isn't /usr/bin/sed")
                     hook.shutil.which = lambda name: "/usr/bin/sed"
-                    hook.GNU_SED_PLACES = (here_marker := tempfile.mkdtemp(dir=self.tmp),)
+                    hook.GNU_SED_PLACES = (tempfile.mkdtemp(dir=self.tmp),)
                     self.assertEqual(hook.sed_flavour(), "gnu", "a GNU sed is installed where a profile may use it")
                 finally:
                     hook.shutil.which, hook.GNU_SED_PLACES = real_which, real_places
@@ -451,6 +453,8 @@ class RepoRulesFirst(unittest.TestCase):
         parent, bname = os.path.dirname(self.b), os.path.basename(self.b)
         braced = os.path.join(self.scratch, "a{b,c}.txt")
         write(braced, "a\n")
+        if not os.path.islink(os.path.join(self.scratch, "lnk")):
+            os.symlink(os.path.join(self.b, "sub"), os.path.join(self.scratch, "lnk"))
         exception = [f"sed -i '' 's/a/b/' {target}", f"sed -i .bak 's/a/b/' {target}", f"sed -E -i '' 's/a?/b/' {target}",
                      f"sed -n -i '' 's/a/b/p' {target}", f"sed -i '' -E 's/(a|b)/x/' {target}", f"sed -i '' '1d' {target}",
                      f"sed -i '' '/^#/d' {target}", f"sed -i '' 's|a|b|g' {target}", f"sed -i '' '$d' {target}",
@@ -458,7 +462,8 @@ class RepoRulesFirst(unittest.TestCase):
                      f"sed -i '' 's/a/b/M' {target}", f"sed -i '' 'y/ab/cd/' {target}",
                      f"sed -i '' 's/a/b/;s/c/d/' {target}", f"sed -i '' 's/a/b/' {target} {other}",
                      f"sed -i '' 's/a/b/' {target} 2>/dev/null", f"sed -i '' 's/a/b/' {target} && echo ok",
-                     f"sed -i '' 's/a/b/' '{target}'", f"sed -i '' 's/a/b/' '{braced}'"]
+                     f"sed -i '' 's/a/b/' '{target}'", f"sed -i '' 's/a/b/' '{braced}'",
+                     f"sed -r -i '' 's/(a)/b/' {target}", f"cd sub; sed -i '' 'x' {target}"]
         # As on main: GNU's -i takes no separate word, so the first word is the script.
         # Main counted every word but the first and the flags: with -f, the script file and the files are elsewhere.
         # The -f script file is read, not written, so one in the main checkout is fine.
@@ -489,6 +494,14 @@ class RepoRulesFirst(unittest.TestCase):
             f"sed -i '' 's''/a''/b''w src/g' {target}",
             # A single-quoted file word with a "$" is a real file name, but the guard skips paths with one.
             f"sed -i '' 's/a/b/' '{self.b}/$x'",
+            # shlex splits a word at \r, zsh doesn't: this reaches BSD sed with the suffix "\rp" and a write as the
+            # script.
+            f"echo 'x'; sed -i ''\r'x' /a/w{self.b}/CLAUDE.md {target}",
+            # Other ways the hook may read the command wrongly.
+            f"sed -i '' 's/a/b/' {target} \\", f"sed -i '' 's/a/b/' {target} 'x", f"sed -i '' 's/a/b/' {target} )",
+            f"sed -i '' 's/a/b/' $'{target}'", f"echo $'a'; sed -i '' 'x' {target}",
+            # `..` through a link: the OS follows the link first, the guard reads `..` as written.
+            f"sed -i '' 's/a/b/' {self.scratch}/lnk/../README.md",
             # zsh's EXTENDED_GLOB ^ expands a file word.
             f"sed -i '' 's/a/b/' {parent}/^x/README.md",
             f"sed -i '' 's/[0-9]//' {target}",
@@ -527,6 +540,8 @@ class RepoRulesFirst(unittest.TestCase):
             f"echo x && command cd sub; sed -i '' 'd' {target}", f"echo cd; sed -i '' 'd' {target}",
             f"cd -; sed -i '' 'd' {target}", f"cd ~rrf-no-such-user; sed -i '' 'd' {target}", f"cd +1; sed -i '' 'd' {target}",
             f"eval 'cd sub'; sed -i '' 'd' {target}", f"sub; sed -i '' 'd' {target}",
+            f"cd sub & sed -i '' 'x' {target}", f"cd nosuch; sed -i '' 'p' {target}",
+            f"CDPATH=/x:.; cd sub; sed -i '' 'x' {target}",
             # GNU reads -i's next word as the script, so these edit files there.
             "sed -i '' p", "sed -n -i '' abc", "dd of=ix status=none < CLAUDE.md; sed -n -i '' ix",
         ]

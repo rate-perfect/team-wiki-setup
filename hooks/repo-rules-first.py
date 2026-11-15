@@ -448,9 +448,14 @@ def literal_words(cmd):
     the same text written another way anywhere in the command. None when the hook may read the command wrongly: a
     `#`, "(", ")" or backslash outside quotes (shlex reads `#` inside a word as a comment and splits zsh glob
     qualifiers like `d(N)` at "("), a backslash in double quotes, an unclosed quote, or a quote or word glued to a
-    redirect, or one quoted part right after another (`'a''b'`, which zsh's RC_QUOTES reads as `a'b`). sed's one
+    redirect, one quoted part right after another (`'a''b'`, which zsh's RC_QUOTES reads as `a'b`), a control
+    character other than tab and newline (shlex splits words at \r, zsh doesn't), a backtick or `$'...'`. sed's one
     exception (`sed_bsd_script`) then doesn't apply."""
     cmd = HEREDOC.sub("<<HEREDOC\n", cmd)
+    # shlex splits words at \r (and other control characters) where zsh doesn't; `$'...'` and backticks the hook
+    # doesn't run either.
+    if re.search(r"[\x00-\x08\x0b-\x1f\x7f`]|\$'", cmd):
+        return None
     whole, other = set(), set()
     word, quoted_only, started, had_quote = [], True, False, False
     i, n = 0, len(cmd)
@@ -501,7 +506,10 @@ def sed_reading(raw, cmd, here):
     a command is followed (not `cd -P`, `cd ~`, `cd +1`, `pushd`, `popd`, `chdir`, `eval`, `{ cd x; ...}`,
     `builtin cd` or zsh's AUTO_CD, a folder's name alone), and sed's exception looks for the script's name in the
     folder the command runs in."""
-    if cmd != raw or os.environ.get("CDPATH"):
+    if cmd != raw or os.environ.get("CDPATH") or "CDPATH" in raw:
+        return None
+    # A lone `&` runs the part before it in the background, so a `cd` there doesn't move the rest.
+    if re.search(r"(?<![&>])&(?![&>])", raw):
         return None
     literal = literal_words(raw)
     if literal is None:
@@ -510,9 +518,12 @@ def sed_reading(raw, cmd, here):
         for i, t in enumerate(tokens):
             if t in ("cd", "pushd", "popd", "chdir", "eval"):
                 if (t != "cd" or i != 0 or len(tokens) != 2 or tokens[1].startswith(("-", "+"))
-                        or SED_EXPANDS.search(tokens[1])):
+                        or SED_EXPANDS.search(tokens[1]) or not os.path.isdir(os.path.join(here or "/", tokens[1]))):
+                    # The last one: a `cd` that fails leaves the shell where it was. (Checked from the folder the
+                    # command starts in, which can only make this stricter after an earlier cd.)
                     return None
-        # zsh's AUTO_CD: a folder's name alone moves there.
+        # zsh's AUTO_CD: a folder's name alone moves there (in an interactive zsh; `zsh -c` doesn't, so this is
+        # only extra care).
         if len(tokens) == 1 and os.path.isdir(os.path.join(here or "/", tokens[0])):
             return None
     return literal
@@ -551,6 +562,9 @@ def sed_bsd_script(args, here, literal, flavour=None):
     # Each file word is one path the guard follows: the shell can't expand it, and it has no "$" (the guard skips
     # paths with one).
     if any(f.startswith("-") or "$" in f or (f not in literal and SED_EXPANDS.search(f)) for f in files):
+        return None
+    # The guard reads `..` without following links (`/other/link/../x` may be in a main checkout).
+    if any(".." in f.split("/") for f in files):
         return None
     if script not in literal or not sed_safe_script(script):
         return None
