@@ -407,7 +407,7 @@ class RepoRulesFirst(unittest.TestCase):
         other = os.path.join(self.scratch, "other.txt")
         for path in (target, other):
             write(path, "a\n")
-        for name in ("abc", "ax", "README.md", ".env", ".gitignore", "p", "q", "sub/p", "sub/d"):
+        for name in ("abc", "ax", "README.md", ".env", ".gitignore", "p", "q", "s.sed", "sub/p", "sub/d"):
             write(os.path.join(self.b, name), "a\n")
         blanks = os.path.join(self.scratch, "s.sed")
         write(blanks, "s/a/b/\n" + "   \n" * 300 + "p\n")
@@ -449,6 +449,8 @@ class RepoRulesFirst(unittest.TestCase):
 
     def check_sed_flavour(self, flavour, target, other, blanks, big):
         parent, bname = os.path.dirname(self.b), os.path.basename(self.b)
+        braced = os.path.join(self.scratch, "a{b,c}.txt")
+        write(braced, "a\n")
         exception = [f"sed -i '' 's/a/b/' {target}", f"sed -i .bak 's/a/b/' {target}", f"sed -E -i '' 's/a?/b/' {target}",
                      f"sed -n -i '' 's/a/b/p' {target}", f"sed -i '' -E 's/(a|b)/x/' {target}", f"sed -i '' '1d' {target}",
                      f"sed -i '' '/^#/d' {target}", f"sed -i '' 's|a|b|g' {target}", f"sed -i '' '$d' {target}",
@@ -456,11 +458,12 @@ class RepoRulesFirst(unittest.TestCase):
                      f"sed -i '' 's/a/b/M' {target}", f"sed -i '' 'y/ab/cd/' {target}",
                      f"sed -i '' 's/a/b/;s/c/d/' {target}", f"sed -i '' 's/a/b/' {target} {other}",
                      f"sed -i '' 's/a/b/' {target} 2>/dev/null", f"sed -i '' 's/a/b/' {target} && echo ok",
-                     f"sed -i '' 's/a/b/' '{target}'"]
+                     f"sed -i '' 's/a/b/' '{target}'", f"sed -i '' 's/a/b/' '{braced}'"]
         # As on main: GNU's -i takes no separate word, so the first word is the script.
         # Main counted every word but the first and the flags: with -f, the script file and the files are elsewhere.
+        # The -f script file is read, not written, so one in the main checkout is fine.
         main_allowed = [f"sed -i 's/a/b/' {target}", f"sed -i.bak 's/a/b/' {target}", f"sed -n -i 's/a/b/p' {target}",
-                        f"sed -i '' -f {blanks} {target}"]
+                        f"sed -i '' -f {blanks} {target}", f"sed -i -f s.sed {target}"]
         for cmd in main_allowed + (exception if flavour == "bsd" else []):
             self.sed_allowed(cmd)
         # Under GNU these read as on main: the script word counts, as a path here (an absolute one, '/^#/d', is
@@ -479,6 +482,15 @@ class RepoRulesFirst(unittest.TestCase):
             f"sed -i '' 'r CLAUDE.md' {target}", f"sed -i '' '1{{w CLAUDE.md\n}}' {target}",
             # sed skips its delimiter inside a bracket expression, so these hide a `w`; any `[` is refused.
             f"sed -i '' 's/[/x/;s|]/|/w out|' {target}",
+            # Flags of s that run or write, with no space to stop them.
+            f"sed -i '' 's/a/b/e' {target}", f"sed -i '' 's/a/b/wp' {target}", f"sed -i '' 's|a|b|wx' {target}",
+            f"sed -i '' 's/a/b/gw' {target}", f"sed -i '' 's/a/b/W' {target}", f"sed -i '' '1\u0661d' {target}",
+            # zsh's RC_QUOTES reads `''` inside quotes as a quote: this reaches sed as s'/a'/b'w src/g, a write.
+            f"sed -i '' 's''/a''/b''w src/g' {target}",
+            # A single-quoted file word with a "$" is a real file name, but the guard skips paths with one.
+            f"sed -i '' 's/a/b/' '{self.b}/$x'",
+            # zsh's EXTENDED_GLOB ^ expands a file word.
+            f"sed -i '' 's/a/b/' {parent}/^x/README.md",
             f"sed -i '' 's/[0-9]//' {target}",
             # `$NAME` filled in by the hook inside single quotes: the shell passes `$w src/g`, a write.
             f"w=s/a/; sed -i '' '$w src/g' {target}", f"X=s/a/b/; sed -i '' $X {target}; echo 's/a/b/'",
@@ -512,7 +524,9 @@ class RepoRulesFirst(unittest.TestCase):
             f"cd sub x && sed -i '' 'd' {target}", f"cd $D && sed -i '' 'd' {target}",
             # `cd sub x` fails in bash and leaves the shell here, where `q` is a file; the hook would follow it.
             f"cd sub x; sed -i '' 'q' {target}",
-            f"echo x && command cd sub; sed -i '' 'd' {target}",
+            f"echo x && command cd sub; sed -i '' 'd' {target}", f"echo cd; sed -i '' 'd' {target}",
+            f"cd -; sed -i '' 'd' {target}", f"cd ~rrf-no-such-user; sed -i '' 'd' {target}", f"cd +1; sed -i '' 'd' {target}",
+            f"eval 'cd sub'; sed -i '' 'd' {target}", f"sub; sed -i '' 'd' {target}",
             # GNU reads -i's next word as the script, so these edit files there.
             "sed -i '' p", "sed -n -i '' abc", "dd of=ix status=none < CLAUDE.md; sed -n -i '' ix",
         ]
@@ -523,6 +537,16 @@ class RepoRulesFirst(unittest.TestCase):
         refused += [c for c in big if not (flavour == "bsd" and c in bsd_suffix_no_file)]
         for cmd in refused:
             self.sed_refused(cmd)
+        if flavour == "bsd":
+            # With CDPATH, `cd sub` may go to another sub/ (here: one under the scratch folder) than the one the hook
+            # follows, so the exception is off.
+            os.makedirs(os.path.join(self.scratch, "sub"), exist_ok=True)
+            os.environ["CDPATH"] = self.scratch
+            try:
+                self.sed_refused(f"cd sub; sed -i '' 'x' {target}")
+            finally:
+                os.environ.pop("CDPATH")
+            self.sed_allowed(f"cd sub; sed -i '' 'x' {target}")
         # A long script is read in linear time (the hook has 15 s, and a timeout lets the call through).
         for script in ("s/" + "\\(\\[a\\]\\)\\." * 15 + "/x/g", "p" + " " * 40_000 + ";p", "s/" + "a" * 50_000):
             start = time.monotonic()
