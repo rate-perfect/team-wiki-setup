@@ -8,6 +8,7 @@ CLAUDE.md it reads are the test's own.
 The repos sit next to this file, not under /tmp: the hook ignores scratch folders (/tmp, /var/folders) on purpose.
 A loose script outside any repo does go under /tmp, as a real scratch script would.
 """
+import importlib.util
 import json
 import os
 import re
@@ -341,6 +342,242 @@ class RepoRulesFirst(unittest.TestCase):
         # A last folder written with a variable: the last one that can be resolved counts.
         for cmd in ("make -C ../repo-c -C $SUB", "npm --prefix ../repo-c --prefix \"$D\" test"):
             self.assert_paused_for(self.run_hook(cmd), c, cmd)
+
+    def sed_refused(self, cmd, cwd=None):
+        r = self.run_hook(cmd, cwd=cwd or self.b, session=uuid.uuid4().hex)
+        self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"),
+                        f"{os.environ.get('REPO_RULES_SED')}: {cmd}: {r}")
+
+    def sed_allowed(self, cmd):
+        self.assertIsNone(self.run_hook(cmd, cwd=self.b, session=uuid.uuid4().hex),
+                          f"{os.environ.get('REPO_RULES_SED')}: {cmd}")
+
+    def test_sed_flavour_is_bsd_only_when_sure(self):
+        spec = importlib.util.spec_from_file_location("rrf_flavour", HOOK)
+        hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hook)
+        saved = {k: os.environ.get(k) for k in ("REPO_RULES_SED", "PATH")}
+        try:
+            for forced in ("bsd", "gnu"):
+                os.environ["REPO_RULES_SED"] = forced
+                self.assertEqual(hook.sed_flavour(), forced)
+            os.environ["REPO_RULES_SED"] = "macos"
+            self.assertIn(hook.sed_flavour(), ("bsd", "gnu"), "any other value means: work it out")
+            os.environ.pop("REPO_RULES_SED")
+            os.environ["PATH"] = os.pathsep.join(["/opt/x/libexec/gnubin", saved["PATH"] or ""])
+            self.assertEqual(hook.sed_flavour(), "gnu", "a gnubin folder on PATH means GNU")
+            os.environ["PATH"] = saved["PATH"] or ""
+            if sys.platform != "darwin":
+                self.assertEqual(hook.sed_flavour(), "gnu", "only macOS has BSD sed as sed")
+            else:
+                real_which, real_places = hook.shutil.which, hook.GNU_SED_PLACES
+                try:
+                    hook.GNU_SED_PLACES = ()
+                    hook.shutil.which = lambda name: "/usr/bin/sed"
+                    os.environ["PATH"] = "/usr/bin:/bin"
+                    self.assertEqual(hook.sed_flavour(), "bsd", "macOS's own sed, nothing else installed")
+                    os.environ["PATH"] = "/usr/local/opt/gnu-sed/libexec/bin:/usr/bin"
+                    self.assertEqual(hook.sed_flavour(), "gnu", "a gnu-sed folder on PATH")
+                    os.environ["PATH"] = "/usr/bin:/bin"
+                    hook.shutil.which = lambda name: "/opt/homebrew/bin/sed"
+                    self.assertEqual(hook.sed_flavour(), "gnu", "sed isn't /usr/bin/sed")
+                    hook.shutil.which = lambda name: "/usr/bin/sed"
+                    hook.GNU_SED_PLACES = (tempfile.mkdtemp(dir=self.tmp),)
+                    self.assertEqual(hook.sed_flavour(), "gnu", "a GNU sed is installed where a profile may use it")
+                finally:
+                    hook.shutil.which, hook.GNU_SED_PLACES = real_which, real_places
+                    os.environ["PATH"] = saved["PATH"] or ""
+            # Whatever the flavour, the exception needs the script not to be a path in the folder.
+            here = tempfile.mkdtemp(dir=self.tmp)
+            write(os.path.join(here, "p"), "a\n")
+            self.assertIsNone(hook.sed_bsd_script(["-i", "", "p", "/x/f"], here, {"p"}, flavour="bsd"))
+            self.assertEqual(hook.sed_bsd_script(["-i", "", "d", "/x/f"], here, {"d"}, flavour="bsd"), "d")
+            self.assertIsNone(hook.sed_bsd_script(["-i", "", "d", "/x/f"], here, {"d"}, flavour="gnu"))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_sed_in_place_counts_only_the_files_it_edits(self):
+        # sed -i is read as main read it, with one exception: on macOS's own sed, exactly
+        # `sed [-E|-n|-r] -i '' 'SCRIPT' FILE...` with a known-safe single-quoted script, from a main checkout, edits
+        # only FILE. Every case runs as BSD sed and as GNU sed.
+        write(os.path.join(self.home, ".claude", "CLAUDE.md"), "# Never change a main checkout\nWork in a worktree.\n")
+        target = os.path.join(self.scratch, "notes.txt")
+        other = os.path.join(self.scratch, "other.txt")
+        for path in (target, other):
+            write(path, "a\n")
+        for name in ("abc", "ax", "README.md", ".env", ".gitignore", "p", "q", "s.sed", "sub/p", "sub/d"):
+            write(os.path.join(self.b, name), "a\n")
+        blanks = os.path.join(self.scratch, "s.sed")
+        write(blanks, "s/a/b/\n" + "   \n" * 300 + "p\n")
+        big = ("sed -i '' 's/a/b/' CLAUDE.md", "sed -i 's/a/b/' CLAUDE.md", "sed -i -e 's/a/b/' CLAUDE.md",
+                    "sed -e 's/a/b/' -i .env", "sed 's/a/b/' -i .env", "sed -f s.sed -i .gitignore",
+                    "sed -e 's/a/b/' -i ./CLAUDE.md", "sed -I '' 's/a/b/' CLAUDE.md", "sed -Ei '' 's/a/b/' CLAUDE.md",
+                    "sed -ni '' 's/a/b/p' CLAUDE.md", "sed --in-place 's/a/b/' CLAUDE.md",
+                    "sed --in-place=.bak 's/a/b/' CLAUDE.md", "sed -i --expr=s/a/b/ CLAUDE.md",
+                    "sed -n -i.bak '' CLAUDE.md", "sed -n -i '' '' CLAUDE.md", "sed -i '' -n '' CLAUDE.md",
+                    "sed -n -i '' CLAUDE.md", "sed '' -n -i CLAUDE.md", "sed --in 's/a/b/' CLAUDE.md",
+                    "sed --in-pl=.bak 's/a/b/' CLAUDE.md", "sed -i --e=s/a/b/ CLAUDE.md", "sed --e=s/a/b/ -i .env",
+                    "sed -i '' 's/a/b/' *.md", "sed -i 's/a/b/' src/*.nothing",
+                    "sed -i '' 's/foo/bar/g' $(grep -rl foo .)", "sed -i '' 's/a/b/' `grep -rl a .`",
+                    "sed -i '' 's/a/b/' {CLAUDE,README}.md", "sed -i '' 's/a/b/' ~+/CLAUDE.md",
+                    f"sed -i '' 's/a/b/w out.txt' {target}", f"sed -i '' -e 'w out.txt' {target}",
+                    f"sed -i '' '1e touch x' {target}", "cd -P src && sed -i '' 's/a/b/' lib.ts",
+                    "curl -so new.md https://example.com && sed -i '' 's/a/b/' new.md", "sed -i '' 's/a/b/' \"$F\"", "sed -i '' 's/a/b/' $FILES", "sed -i '' 's/a/b/' ${F}",
+                    "sed -i '' 's/a/b/' docs/{guide,other}.md",
+                    "for f in *.md; do\n  sed -i '' 's/a/b/' \"$f\"\ndone",
+                    "ls | while read -r f; do\n sed -i '' 's/a/b/' \"$f\"\ndone",
+                    f"sed -i '' '1{{w CLAUDE.md\n}}' {target}", f"sed -i '' -e '1{{w CLAUDE.md' -e '}}' {target}",
+                    f"sed -i '' '1!{{w CLAUDE.md\n}}' {target}", f"sed -i '' 's/a/b/ w CLAUDE.md' {target}",
+                    f"sed -i '' 'p;wCLAUDE.md' {target}", "cd -P src && sed -i '' 's/a/b/' s.md",
+                    "sed -i '' 's/a/b/' {1..3}.md", "sed -i '' 's/a/b/' s.md x",
+                    f"sed -i '' 'sxaxbxw CLAUDE.md' {target}", f"sed -i '' 's a b w CLAUDE.md' {target}",
+                    f"sed -i '' '0~1w CLAUDE.md' {target}", f"sed -i '' '1,+2w CLAUDE.md' {target}",
+                    f"sed -i '' '\\%a%w CLAUDE.md' {target}", f"sed -i '' '1!!w CLAUDE.md' {target}",
+                    "curl -so new.md https://example.com && sed -n -i '' new.md")
+        saved = os.environ.get("REPO_RULES_SED")
+        try:
+            for flavour in ("bsd", "gnu"):
+                os.environ["REPO_RULES_SED"] = flavour
+                self.check_sed_flavour(flavour, target, other, blanks, big)
+        finally:
+            if saved is None:
+                os.environ.pop("REPO_RULES_SED", None)
+            else:
+                os.environ["REPO_RULES_SED"] = saved
+
+    def check_sed_flavour(self, flavour, target, other, blanks, big):
+        parent, bname = os.path.dirname(self.b), os.path.basename(self.b)
+        braced = os.path.join(self.scratch, "a{b,c}.txt")
+        write(braced, "a\n")
+        if not os.path.islink(os.path.join(self.scratch, "lnk")):
+            os.symlink(os.path.join(self.b, "sub"), os.path.join(self.scratch, "lnk"))
+        exception = [f"sed -i '' 's/a/b/' {target}", f"sed -i .bak 's/a/b/' {target}", f"sed -E -i '' 's/a?/b/' {target}",
+                     f"sed -n -i '' 's/a/b/p' {target}", f"sed -i '' -E 's/(a|b)/x/' {target}", f"sed -i '' '1d' {target}",
+                     f"sed -i '' '/^#/d' {target}", f"sed -i '' 's|a|b|g' {target}", f"sed -i '' '$d' {target}",
+                     f"sed -i '' 's/a$//' {target}", f"sed -i '' 's/ *$//' {target}", f"sed -i '' 's/a.*/b/' {target}",
+                     f"sed -i '' 's/a/b/M' {target}", f"sed -i '' 'y/ab/cd/' {target}",
+                     f"sed -i '' 's/a/b/;s/c/d/' {target}", f"sed -i '' 's/a/b/' {target} {other}",
+                     f"sed -i '' 's/a/b/' {target} 2>/dev/null",
+                     f"sed -i '' 's/a/b/' '{target}'", f"sed -i '' 's/a/b/' '{braced}'",
+                     f"sed -r -i '' 's/(a)/b/' {target}",
+                     f"sed -i '' 's/foo/&bar/' {target}", f"sed -i '' 's/^/& /' {target}",
+                     f"sed -i '' 's/a/b/' {target} &>/dev/null", f"sed -i '' 's/a/b/' {target} 2>&1"]
+        # As on main: GNU's -i takes no separate word, so the first word is the script.
+        # Main counted every word but the first and the flags: with -f, the script file and the files are elsewhere.
+        # The -f script file is read, not written, so one in the main checkout is fine.
+        main_allowed = [f"sed -i 's/a/b/' {target}", f"sed -i.bak 's/a/b/' {target}", f"sed -n -i 's/a/b/p' {target}",
+                        f"sed -i '' -f {blanks} {target}", f"sed -i -f s.sed {target}"]
+        for cmd in main_allowed + (exception if flavour == "bsd" else []):
+            self.sed_allowed(cmd)
+        # Under GNU these read as on main: the script word counts, as a path here (an absolute one, '/^#/d', is
+        # elsewhere, and main skipped any path with a "$").
+        refused = ([c for c in exception if "'/" not in c and "$" not in c.split(target)[0]]
+                   if flavour == "gnu" else []) + [
+            # Not the exception's exact form: the script unquoted, quoted another way, or named like a file there;
+            # -e, -f, --, or any option after the script; a suffix other than '' or .ext.
+            f"sed -i '' s/a/b/ {target}", f"sed -i '' \"s/a/b/\" {target}", f"sed -i '' 'p' {target}",
+            f"sed -i '' -e 's/a/b/' {target}", f"sed -i '' -- 's/a/b/' {target}",
+            f"sed -i '' 's/a/b/' -- {target}", f"sed -i '' 's/a/b/' -e ../repo-b/README.md",
+            f"sed -i 's/a/b/' -- -e ../repo-b/README.md", f"sed -i -- 's/a/b/' -e ../repo-b/README.md",
+            f"POSIXLY_CORRECT=1 sed -i 's/a/b/' -e ../repo-b/README.md {target}", f"sed -i '/x' 's/a/b/' {target}",
+            f"sed -I '' 's/a/b/' {target}", f"sed -Ei '' 's/a/b/' {target}", f"sed -i '' 'a\\' {target}",
+            f"sed -i '' 's/a/b/w CLAUDE.md' {target}", f"sed -i '' 'w CLAUDE.md' {target}", f"sed -i '' '1e x' {target}",
+            f"sed -i '' 'r CLAUDE.md' {target}", f"sed -i '' '1{{w CLAUDE.md\n}}' {target}",
+            # sed skips its delimiter inside a bracket expression, so these hide a `w`; any `[` is refused.
+            f"sed -i '' 's/[/x/;s|]/|/w out|' {target}",
+            # Flags of s that run or write, with no space to stop them.
+            f"sed -i '' 's/a/b/e' {target}", f"sed -i '' 's/a/b/wp' {target}", f"sed -i '' 's|a|b|wx' {target}",
+            f"sed -i '' 's/a/b/gw' {target}", f"sed -i '' 's/a/b/W' {target}", f"sed -i '' '1\u0661d' {target}",
+            # zsh's RC_QUOTES reads `''` inside quotes as a quote: this reaches sed as s'/a'/b'w src/g, a write.
+            f"sed -i '' 's''/a''/b''w src/g' {target}",
+            # A single-quoted file word with a "$" is a real file name, but the guard skips paths with one.
+            f"sed -i '' 's/a/b/' '{self.b}/$x'",
+            # shlex splits a word at \r, zsh doesn't: this reaches BSD sed with the suffix "\rp" and a write as the
+            # script.
+            f"echo 'x'; sed -i ''\r'x' /a/w{self.b}/CLAUDE.md {target}",
+            # Other ways the hook may read the command wrongly.
+            f"sed -i '' 's/a/b/' {target} \\", f"sed -i '' 's/a/b/' {target} 'x", f"sed -i '' 's/a/b/' {target} )",
+            f"echo $'a'; sed -i '' 'x' {target}", f"echo `true`; sed -i '' 's/a/b/' {target}",
+            f"cd sub; cd sub; sed -i '' 'x' {target}",
+            # The hook drops a heredoc's body and the rest of its first line; zsh runs `cd sub` here.
+            f"cat <<EOF & cd sub\nbody\nEOF\nsed -i '' 'x' {target}",
+            f"cat <<EOF; cd sub\nbody\nEOF\nsed -i '' 'x' {target}",
+            # zsh lets quotes nest inside "${...}", so this runs `cd sub` where a plain reader sees quoted text.
+            f"echo \"${{x:-\"'\"}}\"; cd sub; echo \"${{x:-\"'\"}}\"; sed -i '' 'x' {target}",
+            # A cd before the sed, run or not.
+            f"false && cd sub; sed -i '' 'x' {target}", f"cd sub | cat; sed -i '' 'x' {target}",
+            f"cd sub/../sub; sed -i '' 'x' {target}",
+            # Background and redirect forms of &.
+            f"sed -i '' 's/a/b/' {target} &", f"sed -i '' 's/a/b/' {target} &|", f"sed -i '' 's/a/b/' {target} &!",
+            f"echo a$'b'; sed -i '' 'x' {target}", f"cdpath+={self.scratch}; cd sub; sed -i '' 'x' {target}",
+            # `..` through a link: the OS follows the link first, the guard reads `..` as written.
+            f"sed -i '' 's/a/b/' {self.scratch}/lnk/../README.md",
+            # zsh's EXTENDED_GLOB ^ expands a file word.
+            f"sed -i '' 's/a/b/' {parent}/^x/README.md",
+            f"sed -i '' 's/[0-9]//' {target}",
+            # `$NAME` filled in by the hook inside single quotes: the shell passes `$w src/g`, a write.
+            f"w=s/a/; sed -i '' '$w src/g' {target}", f"X=s/a/b/; sed -i '' $X {target}; echo 's/a/b/'",
+            # File words the shell expands into the main checkout, written as absolute paths.
+            f"sed -i '' 's/a/b/' {parent}/{{x,{bname}}}/README.md", f"sed -i '' 's/a/b/' {parent}/{bname[:-1]}?/README.md",
+            f"sed -i '' 's/a/b/' {parent}/{bname[:-2]}*/README.md",
+            f"sed -i '' 's/a/b/' {parent}/[{bname[0]}]{bname[1:]}/README.md",
+            f"sed -i '' 's/a/b/' {parent}/{bname}``/README.md",
+            f"sed -i '' '' {target}",
+            # A file word the shell expands, which the guard can't follow.
+            "sed -i '' 's/a/b/' \"$F\"", "sed -i '' 's/a/b/' $F", "sed -i '' 's/a/b/' *.md", "sed -i '' 's/a/b/' ~/x",
+            "sed -i '' 's/a/b/' `echo README.md`", "sed -i '' 's/a/b/' {README,x}.md",
+            # The shell turns these into several words, or into files there.
+            "sed -n -i '' a*", "sed -n -i '' a{bc,x}", "sed -n -i '' a`echo x`", "sed -n -i '' ab?", "sed -n -i '' a[b]c",
+            "sed -i .* -e 1d", "sed -i .{gitignore,x} -e 1d",
+            f"sed -n -i '' a[[:alpha:]]* {target}",
+            # Where the hook may read the command wrongly, the exception doesn't apply: `#` inside a word, zsh glob
+            # qualifiers and numeric globs, a quote with a redirect glued on, backslashes in double quotes.
+            "sed -n -i '' q#x README.md", f"sed -i '' 's/a/b/'#x README.md", "sed -n -i '' d(N) README.md",
+            "sed -n -i '' x<->", "sed -n -i '' <->d", "sed -n -i '' 'h'2>/dev/null",
+            f"echo \"\\\\\" ; sed -i '' 's/a/b/' README.md ; echo '\"\\' 'a*'",
+            f"echo \"\\\"\" ; sed -i '' 's/a/b/' README.md ; echo '\"'",
+            # The same text unquoted elsewhere in the command isn't literal.
+            f"echo s/a/b/; sed -i '' 's/a/b/' README.md",
+            # Anything before or around the sed: the hook can't always tell which folder it runs in, or whether a
+            # file named like the script was made first, so only a lone sed gets the exception. (`d` is a file only
+            # in sub/.)
+            f"cd sub; sed -i '' 'x' {target}", f"sed -i '' 's/a/b/' {target} && echo ok",
+            f">&2cd sub; sed -i '' 'q' {target}", f"${{x}}cd sub; sed -i '' 'd' {target}",
+            f"{{ cd sub; sed -i '' 'd' {target}; }}", f"cd -P sub && sed -i '' 'd' {target}",
+            f"pushd sub && sed -i '' 'd' {target}", f"builtin cd sub && sed -i '' 'd' {target}",
+            f"chdir sub && sed -i '' 'd' {target}", f"popd; sed -i '' 'd' {target}",
+            f"cd sub x && sed -i '' 'd' {target}", f"cd $D && sed -i '' 'd' {target}",
+            # `cd sub x` fails in bash and leaves the shell here, where `q` is a file.
+            f"cd sub x; sed -i '' 'q' {target}",
+            f"echo x && command cd sub; sed -i '' 'd' {target}", f"echo cd; sed -i '' 'd' {target}",
+            f"cd -; sed -i '' 'd' {target}", f"cd ~rrf-no-such-user; sed -i '' 'd' {target}", f"cd +1; sed -i '' 'd' {target}",
+            f"eval 'cd sub'; sed -i '' 'd' {target}", f"sub; sed -i '' 'd' {target}",
+            f"cd sub & sed -i '' 'x' {target}", f"cd nosuch; sed -i '' 'p' {target}",
+            f"CDPATH=/x:.; cd sub; sed -i '' 'x' {target}",
+            # GNU reads -i's next word as the script, so these edit files there.
+            "sed -i '' p", "sed -n -i '' abc", "dd of=ix status=none < CLAUDE.md; sed -n -i '' ix",
+        ]
+        # BSD reads the word after -i as the suffix and then has nothing to edit (it refuses -i on stdin); GNU edits
+        # these.
+        bsd_suffix_no_file = {"sed -e 's/a/b/' -i .env", "sed -f s.sed -i .gitignore", "sed --e=s/a/b/ -i .env",
+                              "sed -e 's/a/b/' -i ./CLAUDE.md"}
+        refused += [c for c in big if not (flavour == "bsd" and c in bsd_suffix_no_file)]
+        for cmd in refused:
+            self.sed_refused(cmd)
+        # A long script is read in linear time (the hook has 15 s, and a timeout lets the call through).
+        for script in ("s/" + "\\(\\[a\\]\\)\\." * 15 + "/x/g", "p" + " " * 40_000 + ";p", "s/" + "a" * 50_000):
+            start = time.monotonic()
+            self.run_hook(f"sed -i '' '{script}' {target}", cwd=self.b, session=uuid.uuid4().hex)
+            self.assertLess(time.monotonic() - start, 3, "a long script is checked quickly")
+        # From a folder that isn't a checkout, a path into the main checkout is still refused.
+        for cmd in (f"sed -i '' 's/a/b/' {self.b}/{{CLAUDE,README}}.md", f"sed -i '' 's/a/b/' {self.b}/README.md",
+                    f"sed -i '' 's/a/b/' \"{self.b}/`echo CLAUDE.md`\"", f"sed -i -f {blanks} {self.b}/CLAUDE.md"):
+            self.sed_refused(cmd, cwd=self.scratch)
+
 
     # --- the main checkout guard ---
 
