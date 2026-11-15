@@ -446,15 +446,14 @@ def sed_flavour():
 def literal_words(cmd):
     """Words written whole in single quotes ('s/a$//'), in which the shell expands nothing, less any word of
     the same text written another way anywhere in the command. None when the hook may read the command wrongly: a
-    `#`, "(", ")" or backslash outside quotes (shlex reads `#` inside a word as a comment and splits zsh glob
+    `#`, "(", ")", a backslash, a lone `&` or `$'` outside quotes (shlex reads `#` inside a word as a comment and splits zsh glob
     qualifiers like `d(N)` at "("), a backslash in double quotes, an unclosed quote, or a quote or word glued to a
     redirect, one quoted part right after another (`'a''b'`, which zsh's RC_QUOTES reads as `a'b`), a control
-    character other than tab and newline (shlex splits words at \r, zsh doesn't), a backtick or `$'...'`. sed's one
+    character other than tab and newline (shlex splits words at \r, zsh doesn't), or a backtick. sed's one
     exception (`sed_bsd_script`) then doesn't apply."""
     cmd = HEREDOC.sub("<<HEREDOC\n", cmd)
-    # shlex splits words at \r (and other control characters) where zsh doesn't; `$'...'` and backticks the hook
-    # doesn't run either.
-    if re.search(r"[\x00-\x08\x0b-\x1f\x7f`]|\$'", cmd):
+    # shlex splits words at \r (and other control characters) where zsh doesn't, and the hook doesn't run backticks.
+    if re.search(r"[\x00-\x08\x0b-\x1f\x7f`]", cmd):
         return None
     whole, other = set(), set()
     word, quoted_only, started, had_quote = [], True, False, False
@@ -473,6 +472,10 @@ def literal_words(cmd):
             continue
         if c in "#()\\":
             return None
+        if c == "$" and cmd[i + 1:i + 2] == "'":
+            return None  # `$'...'`: zsh reads escapes in it that the hook doesn't
+        if c == "&" and cmd[i - 1:i] not in ("&", ">") and cmd[i + 1:i + 2] not in ("&", ">"):
+            return None  # a lone `&` runs what comes before it in the background, so a `cd` there doesn't move the rest
         if c in "<>" and started and not (not had_quote and "".join(word).isdigit()):
             # `'h'2>x` and zsh's numeric globs (`x<->`, `<1-9>d`) are one word to the shell, not a word and a
             # redirect. Only a plain fd number (`2>`) may come right before a redirect.
@@ -506,25 +509,24 @@ def sed_reading(raw, cmd, here):
     a command is followed (not `cd -P`, `cd ~`, `cd +1`, `pushd`, `popd`, `chdir`, `eval`, `{ cd x; ...}`,
     `builtin cd` or zsh's AUTO_CD, a folder's name alone), and sed's exception looks for the script's name in the
     folder the command runs in."""
-    if cmd != raw or os.environ.get("CDPATH") or "CDPATH" in raw:
-        return None
-    # A lone `&` runs the part before it in the background, so a `cd` there doesn't move the rest.
-    if re.search(r"(?<![&>])&(?![&>])", raw):
+    if cmd != raw or os.environ.get("CDPATH") or re.search(r"cdpath", raw, re.I):
         return None
     literal = literal_words(raw)
     if literal is None:
         return None
+    folder = here or "/"
     for tokens in shell_segments(raw):
         for i, t in enumerate(tokens):
             if t in ("cd", "pushd", "popd", "chdir", "eval"):
                 if (t != "cd" or i != 0 or len(tokens) != 2 or tokens[1].startswith(("-", "+"))
-                        or SED_EXPANDS.search(tokens[1]) or not os.path.isdir(os.path.join(here or "/", tokens[1]))):
-                    # The last one: a `cd` that fails leaves the shell where it was. (Checked from the folder the
-                    # command starts in, which can only make this stricter after an earlier cd.)
+                        or SED_EXPANDS.search(tokens[1]) or not os.path.isdir(os.path.join(folder, tokens[1]))):
+                    # The last one: a `cd` that fails leaves the shell where it was.
                     return None
+        if tokens and tokens[0] == "cd":
+            folder = os.path.join(folder, tokens[1])
         # zsh's AUTO_CD: a folder's name alone moves there (in an interactive zsh; `zsh -c` doesn't, so this is
         # only extra care).
-        if len(tokens) == 1 and os.path.isdir(os.path.join(here or "/", tokens[0])):
+        elif len(tokens) == 1 and os.path.isdir(os.path.join(folder, tokens[0])):
             return None
     return literal
 

@@ -463,7 +463,9 @@ class RepoRulesFirst(unittest.TestCase):
                      f"sed -i '' 's/a/b/;s/c/d/' {target}", f"sed -i '' 's/a/b/' {target} {other}",
                      f"sed -i '' 's/a/b/' {target} 2>/dev/null", f"sed -i '' 's/a/b/' {target} && echo ok",
                      f"sed -i '' 's/a/b/' '{target}'", f"sed -i '' 's/a/b/' '{braced}'",
-                     f"sed -r -i '' 's/(a)/b/' {target}", f"cd sub; sed -i '' 'x' {target}"]
+                     f"sed -r -i '' 's/(a)/b/' {target}", f"cd sub; sed -i '' 'x' {target}",
+                     f"sed -i '' 's/foo/&bar/' {target}", f"sed -i '' 's/^/& /' {target}",
+                     f"grep -q 'x$' {target} && sed -i '' 's/a/b/' {target}"]
         # As on main: GNU's -i takes no separate word, so the first word is the script.
         # Main counted every word but the first and the flags: with -f, the script file and the files are elsewhere.
         # The -f script file is read, not written, so one in the main checkout is fine.
@@ -499,7 +501,8 @@ class RepoRulesFirst(unittest.TestCase):
             f"echo 'x'; sed -i ''\r'x' /a/w{self.b}/CLAUDE.md {target}",
             # Other ways the hook may read the command wrongly.
             f"sed -i '' 's/a/b/' {target} \\", f"sed -i '' 's/a/b/' {target} 'x", f"sed -i '' 's/a/b/' {target} )",
-            f"sed -i '' 's/a/b/' $'{target}'", f"echo $'a'; sed -i '' 'x' {target}",
+            f"echo $'a'; sed -i '' 'x' {target}", f"echo `true`; sed -i '' 's/a/b/' {target}",
+            f"cd sub; cd sub; sed -i '' 'x' {target}", f"cdpath+={self.scratch}; cd sub; sed -i '' 'x' {target}",
             # `..` through a link: the OS follows the link first, the guard reads `..` as written.
             f"sed -i '' 's/a/b/' {self.scratch}/lnk/../README.md",
             # zsh's EXTENDED_GLOB ^ expands a file word.
