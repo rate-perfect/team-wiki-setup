@@ -92,6 +92,12 @@ class RepoRulesFirst(unittest.TestCase):
         self.assertIsNotNone(reason, f"{what}: should pause")
         self.assertIn(f"run code in {repo}", reason, what)
 
+    def test_publishing_from_another_repo_asks_for_its_rules(self):
+        # npm commands that write to a checkout or publish from it count as working there, like a build.
+        for cmd in ("npm --prefix ../repo-b publish", "npm --prefix ../repo-b pack", "npm --prefix ../repo-b audit fix",
+                    "npm --prefix ../repo-b pkg set name=x"):
+            self.assert_paused_for(self.run_hook(cmd, session=uuid.uuid4().hex), self.b, cmd)
+
     # --- running code in repo B from repo A counts as working in repo B ---
 
     def test_script_in_other_repo(self):
@@ -641,7 +647,9 @@ class RepoRulesFirst(unittest.TestCase):
         # npm commands that write to the checkout or publish from it are refused there; their read-only forms aren't.
         for cmd in (f"npm --prefix {self.b} publish", f"npm --prefix {self.b} pack", f"npm --prefix {self.b} shrinkwrap",
                     f"npm --prefix {self.b} audit fix", f"npm --prefix {self.b} pkg set name=x",
-                    f"npm --prefix {self.b} pkg delete scripts.x", f"cd {self.b} && npm publish --dry-run"):
+                    f"npm --prefix {self.b} pkg delete scripts.x", f"cd {self.b} && npm publish --dry-run",
+                    f"npm --prefix {self.b} audit --json fix", f"npm --prefix {self.b} pkg --json set a=b",
+                    f"npm --prefix {self.b} --otp 123456 publish", f"npm --prefix {self.b} --access public publish"):
             r = self.run_hook(cmd, cwd=outside, session=session)
             self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
         for cmd in (f"npm --prefix {self.b} audit", f"npm --prefix {self.b} pkg get name", f"npm --prefix {self.b} packages"):

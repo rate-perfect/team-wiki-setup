@@ -36,7 +36,7 @@ different folder. If Claude hasn't read them, the hook pauses the change and
 shows the rules (or names the files to read). The hook holds no rules of its
 own, so each repo stays the source of truth. Commands that only read (such
 as `git status`, `cat`, `grep` or `npm view`) are not paused. Builds, installs
-and package commands count as changes: `npm install`/`ci`/`run`, `make`,
+and package commands count as changes: `npm install`/`ci`/`run`/`publish`/`pack`, `make`,
 `dotnet test`, and every `pnpm` or `yarn` command (even `pnpm list`; the hook
 doesn't tell their subcommands apart).
 
@@ -101,7 +101,8 @@ Optional settings for the repo rules hook:
   that install, remove, link, rebuild, create a package, run a script or
   publish (such as `npm ci`, `npm add`, `npm run build`, `npm publish`,
   `npm pack`, `npm audit fix` or `npm pkg set`; not read-only `npm audit` or
-  `npm pkg get`), every `pnpm` or `yarn` command including `pnpm test`,
+  `npm pkg get`; npm's own abbreviations, such as `npm publ`, aren't caught),
+  every `pnpm` or `yarn` command including `pnpm test`,
   `make` and `dotnet`, also when `--prefix`, `-C`, `--dir`, `--cwd` or
   `--directory` points at it. It reads the command as written for the current
   folder, which also refuses a few read-only commands that start with those
