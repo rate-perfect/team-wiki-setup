@@ -324,7 +324,8 @@ LAST_ARG_WRITERS = {"cp", "mv", "ln", "rsync", "install"}
 PKG_TOOLS = re.compile(r"^(?:dotnet\s+(?:add|remove|new|format|build|restore|test|publish|run)|npm\s+(?:install|i|in|ins|inst|insta|instal|"
                        r"isnt|isnta|isntal|isntall|add|ci|clean-install|ic|install-clean|isntall-clean|init|create|innit|"
                        r"uninstall|un|rm|r|remove|update|up|upgrade|udpate|link|ln|unlink|rebuild|rb|prune|dedupe|ddp|"
-                       r"version|run|rum|urn|run-script|install-test|it|install-ci-test|cit|clean-install-test|sit)"
+                       r"version|run|rum|urn|run-script|install-test|it|install-ci-test|cit|clean-install-test|sit|"
+                       r"publish|pack|shrinkwrap|audit(?:\s+-\S+)*\s+fix|pkg(?:\s+-\S+)*\s+(?:set|delete|fix))"
                        r"(?=\s|$)|pnpm\s+\S+|yarn\s*\S*|poetry\s+\S+|make\b)")
 # origin/main's own pattern, read on the command as written. The main checkout guard refuses everything it matches
 # in the current folder, so the guard is never more permissive than it was; folder flags only add refusals.
@@ -647,7 +648,7 @@ def segment_targets(tokens, here, guard=False, literal=frozenset()):
 
 # npm's flags that may come before its subcommand (`npm -w pkg run build`, `npm --silent ci`), and which take a value.
 NPM_VALUE_FLAGS = {"-w", "--workspace", "--loglevel", "--registry", "--userconfig", "--cache", "--omit", "--include",
-                   "--tag", "--scope", "--before"}
+                   "--tag", "--scope", "--before", "--otp", "--access"}
 
 
 def without_dir_flags(cmd, args):
