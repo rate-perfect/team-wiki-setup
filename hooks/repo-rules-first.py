@@ -324,7 +324,8 @@ LAST_ARG_WRITERS = {"cp", "mv", "ln", "rsync", "install"}
 PKG_TOOLS = re.compile(r"^(?:dotnet\s+(?:add|remove|new|format|build|restore|test|publish|run)|npm\s+(?:install|i|in|ins|inst|insta|instal|"
                        r"isnt|isnta|isntal|isntall|add|ci|clean-install|ic|install-clean|isntall-clean|init|create|innit|"
                        r"uninstall|un|rm|r|remove|update|up|upgrade|udpate|link|ln|unlink|rebuild|rb|prune|dedupe|ddp|"
-                       r"version|run|rum|urn|run-script|install-test|it|install-ci-test|cit|clean-install-test|sit)"
+                       r"version|run|rum|urn|run-script|install-test|it|install-ci-test|cit|clean-install-test|sit|"
+                       r"publish|pack|shrinkwrap|audit\s+fix|pkg\s+(?:set|delete|fix))"
                        r"(?=\s|$)|pnpm\s+\S+|yarn\s*\S*|poetry\s+\S+|make\b)")
 # origin/main's own pattern, read on the command as written. The main checkout guard refuses everything it matches
 # in the current folder, so the guard is never more permissive than it was; folder flags only add refusals.

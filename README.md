@@ -98,9 +98,10 @@ Optional settings for the repo rules hook:
   `~/.claude/CLAUDE.md`, outside the team block, saying what you allow. The
   hook then refuses edits, commits, branch switches, installs and builds in a
   repo's main checkout and quotes your section back: the common npm commands
-  that install, remove, link, rebuild, create a package or run a script (such
-  as `npm ci`, `npm add` or `npm run build`; not `npm publish`, `npm pack` or
-  `npm audit fix`), every `pnpm` or `yarn` command including `pnpm test`,
+  that install, remove, link, rebuild, create a package, run a script or
+  publish (such as `npm ci`, `npm add`, `npm run build`, `npm publish`,
+  `npm pack`, `npm audit fix` or `npm pkg set`; not read-only `npm audit` or
+  `npm pkg get`), every `pnpm` or `yarn` command including `pnpm test`,
   `make` and `dotnet`, also when `--prefix`, `-C`, `--dir`, `--cwd` or
   `--directory` points at it. It reads the command as written for the current
   folder, which also refuses a few read-only commands that start with those

@@ -638,6 +638,15 @@ class RepoRulesFirst(unittest.TestCase):
                           "running its code only reads it")
         self.assertIsNone(self.run_hook(f"npm --prefix {self.b} test", cwd=outside, session=session),
                           "npm test isn't refused there, as before")
+        # npm commands that write to the checkout or publish from it are refused there; their read-only forms aren't.
+        for cmd in (f"npm --prefix {self.b} publish", f"npm --prefix {self.b} pack", f"npm --prefix {self.b} shrinkwrap",
+                    f"npm --prefix {self.b} audit fix", f"npm --prefix {self.b} pkg set name=x",
+                    f"npm --prefix {self.b} pkg delete scripts.x", f"cd {self.b} && npm publish --dry-run"):
+            r = self.run_hook(cmd, cwd=outside, session=session)
+            self.assertTrue(r and r.startswith(f"MAIN CHECKOUT: this call would change {self.b},"), f"{cmd}: {r}")
+        for cmd in (f"npm --prefix {self.b} audit", f"npm --prefix {self.b} pkg get name", f"npm --prefix {self.b} packages"):
+            r = self.run_hook(cmd, cwd=outside, session=session)
+            self.assertTrue(r is None or not r.startswith("MAIN CHECKOUT"), f"{cmd}: {r}")
 
 
 if __name__ == "__main__":
